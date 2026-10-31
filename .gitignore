@@ -28,3 +28,9 @@ leaf-server/build.gradle.kts
 leaf-server/src/minecraft
 paper-api
 paper-server
+
+# Local artifacts
+leaf.jar
+.agent/
+libraries/
+versions/

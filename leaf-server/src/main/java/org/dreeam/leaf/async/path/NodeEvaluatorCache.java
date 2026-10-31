@@ -38,7 +38,15 @@ public final class NodeEvaluatorCache {
         Validate.notNull(generator, "NodeEvaluator already returned");
 
         final int feature = NodeEvaluatorFeatures.fromNodeEvaluator(nodeEvaluator);
-        nodeEvaluators.computeIfAbsent(feature, key -> new ArrayDeque<>()).offer(nodeEvaluator);
+        ArrayDeque<NodeEvaluator> deque = nodeEvaluators.computeIfAbsent(feature, key -> new ArrayDeque<>());
+        if (deque.size() < 64) {
+            deque.offer(nodeEvaluator);
+        }
+    }
+
+    public static synchronized void clear() {
+        nodeEvaluators.clear();
+        nodeEvaluatorToGenerator.clear();
     }
 
     public static synchronized void removeNodeEvaluator(final NodeEvaluator nodeEvaluator) {

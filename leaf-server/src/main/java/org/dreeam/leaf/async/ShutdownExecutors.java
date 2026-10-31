@@ -47,5 +47,8 @@ public class ShutdownExecutors {
             } catch (InterruptedException ignored) {
             }
         }
+
+        org.dreeam.leaf.async.path.NodeEvaluatorCache.clear();
+        org.dreeam.leaf.world.region.linear.LinearV3ZstdContextPool.shutdown();
     }
 }

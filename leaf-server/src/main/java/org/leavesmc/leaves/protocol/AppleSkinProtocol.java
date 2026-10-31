@@ -31,9 +31,9 @@ public class AppleSkinProtocol implements LeavesProtocol {
 
     private static final float MINIMUM_EXHAUSTION_CHANGE_THRESHOLD = 0.01F;
 
-    private static final Map<ServerPlayer, Float> previousSaturationLevels = new HashMap<>();
-    private static final Map<ServerPlayer, Float> previousExhaustionLevels = new HashMap<>();
-    private static final Map<ServerPlayer, Boolean> previousNaturalRegeneration = new HashMap<>();
+    private static final Map<UUID, Float> previousSaturationLevels = new HashMap<>();
+    private static final Map<UUID, Float> previousExhaustionLevels = new HashMap<>();
+    private static final Map<UUID, Boolean> previousNaturalRegeneration = new HashMap<>();
 
     private static final Map<UUID, Set<String>> subscribedChannels = new HashMap<>();
 
@@ -67,33 +67,34 @@ public class AppleSkinProtocol implements LeavesProtocol {
                 continue;
             }
 
+            UUID playerId = entry.getKey();
             FoodData data = player.getFoodData();
             for (String channel : entry.getValue()) {
                 switch (channel) {
                     case "saturation" -> {
                         float saturation = data.getSaturationLevel();
-                        Float previousSaturation = previousSaturationLevels.get(player);
+                        Float previousSaturation = previousSaturationLevels.get(playerId);
                         if (previousSaturation == null || saturation != previousSaturation) {
                             ProtocolUtils.sendBytebufPacket(player, SATURATION_KEY, buf -> buf.writeFloat(saturation));
-                            previousSaturationLevels.put(player, saturation);
+                            previousSaturationLevels.put(playerId, saturation);
                         }
                     }
 
                     case "exhaustion" -> {
                         float exhaustion = data.exhaustionLevel;
-                        Float previousExhaustion = previousExhaustionLevels.get(player);
+                        Float previousExhaustion = previousExhaustionLevels.get(playerId);
                         if (previousExhaustion == null || Math.abs(exhaustion - previousExhaustion) >= MINIMUM_EXHAUSTION_CHANGE_THRESHOLD) {
                             ProtocolUtils.sendBytebufPacket(player, EXHAUSTION_KEY, buf -> buf.writeFloat(exhaustion));
-                            previousExhaustionLevels.put(player, exhaustion);
+                            previousExhaustionLevels.put(playerId, exhaustion);
                         }
                     }
 
                     case "natural_regeneration" -> {
                         boolean regeneration = player.level().getGameRules().get(GameRules.NATURAL_HEALTH_REGENERATION);
-                        Boolean previousRegeneration = previousNaturalRegeneration.get(player);
+                        Boolean previousRegeneration = previousNaturalRegeneration.get(playerId);
                         if (previousRegeneration == null || regeneration != previousRegeneration) {
                             ProtocolUtils.sendBytebufPacket(player, NATURAL_REGENERATION_KEY, buf -> buf.writeBoolean(regeneration));
-                            previousNaturalRegeneration.put(player, regeneration);
+                            previousNaturalRegeneration.put(playerId, regeneration);
                         }
                     }
                 }
@@ -113,9 +114,10 @@ public class AppleSkinProtocol implements LeavesProtocol {
     }
 
     private static void resetPlayerData(@NotNull ServerPlayer player) {
-        previousExhaustionLevels.remove(player);
-        previousSaturationLevels.remove(player);
-        previousNaturalRegeneration.remove(player);
+        UUID playerId = player.getUUID();
+        previousExhaustionLevels.remove(playerId);
+        previousSaturationLevels.remove(playerId);
+        previousNaturalRegeneration.remove(playerId);
     }
 
     @Override

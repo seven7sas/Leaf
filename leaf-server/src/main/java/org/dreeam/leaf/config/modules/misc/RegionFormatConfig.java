@@ -27,7 +27,7 @@ public class RegionFormatConfig extends ConfigModules {
     private static boolean regionFormatLoaded = false;
 
     public static boolean isReadOnlyMode() {
-        return LeafConstants.LINEAR_V2_READ_ONLY && regionFormat == EnumRegionFormat.LINEAR_V2;
+        return LeafConstants.LINEAR_V2_READ_ONLY && (regionFormat == EnumRegionFormat.LINEAR_V2 || regionFormat == EnumRegionFormat.LINEAR_V3);
     }
 
     @Override
@@ -49,8 +49,8 @@ public class RegionFormatConfig extends ConfigModules {
 
         regionFormatName = config.getString(getBasePath() + ".format-name", regionFormatName,
             config.pickStringRegionBased(
-                "Available region format names: MCA, B_LINEAR, LINEAR_V2",
-                "可用格式: MCA, B_LINEAR, LINEAR_V2"));
+                "Available region format names: MCA, B_LINEAR, LINEAR_V2, LINEAR_V3",
+                "可用格式: MCA, B_LINEAR, LINEAR_V2, LINEAR_V3"));
         compressionLevel = config.getInt(getBasePath() + ".compress-level", compressionLevel);
         ioThreadCount = config.getInt(getBasePath() + ".io-thread-count", ioThreadCount);
         ioFlushDelay = config.getInt(getBasePath() + ".io-flush-delay", ioFlushDelay);
@@ -81,6 +81,10 @@ public class RegionFormatConfig extends ConfigModules {
             LinearRegionFile.SAVE_DELAY_MS = ioFlushDelay <= 0 ? 100 : ioFlushDelay;
             LinearRegionFile.SAVE_THREAD_MAX_COUNT = ioThreadCount;
             LinearRegionFile.USE_VIRTUAL_THREAD = linearUseVirtualThread;
+        }
+
+        if (regionFormat == EnumRegionFormat.LINEAR_V3) {
+            checkCompressionLevel();
         }
 
         if (regionFormat == EnumRegionFormat.B_LINEAR) {

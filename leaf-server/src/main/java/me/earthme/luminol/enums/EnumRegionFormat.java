@@ -5,10 +5,12 @@ import me.earthme.luminol.data.BufferedLinearRegionFile;
 import me.earthme.luminol.utils.IRegionCreateFunction;
 import net.minecraft.world.level.chunk.storage.RegionFile;
 import org.dreeam.leaf.config.modules.misc.RegionFormatConfig;
+import org.dreeam.leaf.world.region.linear.LinearV3MigrationHelper;
 
 public enum EnumRegionFormat {
     MCA("mca", "mca", info -> new RegionFile(info.info(), info.filePath(), info.folder(), info.sync())),
     LINEAR_V2("linear_v2", "linear", info -> new LinearRegionFile(info.info(), info.filePath(), info.folder(), info.sync(), RegionFormatConfig.compressionLevel)),
+    LINEAR_V3("linear_v3", "linear", LinearV3MigrationHelper::createOrMigrate),
     B_LINEAR("b_linear", "b_linear", info -> new BufferedLinearRegionFile(info.filePath(), RegionFormatConfig.compressionLevel, RegionFormatConfig.blinearFlusher)),
     UNKNOWN("unknown", "mca", info -> null);
 
@@ -27,6 +29,10 @@ public enum EnumRegionFormat {
             if (format.name.equalsIgnoreCase(string)) {
                 return format;
             }
+        }
+
+        if ("linear".equalsIgnoreCase(string)) {
+            return LINEAR_V3;
         }
 
         return UNKNOWN;

@@ -14,7 +14,11 @@ public class CachedOrNewBitsGetter {
     }
 
     public static BitSet getCachedOrNewBitSet(int bits) {
-        final BitSet bitSet = BITSETS.get().computeIfAbsent(bits, BITSET_CONSTRUCTOR);
+        Int2ObjectOpenHashMap<BitSet> map = BITSETS.get();
+        if (map.size() > 64) {
+            map.clear();
+        }
+        final BitSet bitSet = map.computeIfAbsent(bits, BITSET_CONSTRUCTOR);
 
         bitSet.clear();
 
