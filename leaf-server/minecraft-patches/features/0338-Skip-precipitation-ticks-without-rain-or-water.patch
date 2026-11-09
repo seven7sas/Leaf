@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Mon, 9 Nov 2026 21:30:00 +0300
+Subject: [PATCH] Skip precipitation ticks without rain or water
+
+
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 375a7b31cbd319f79cc31a3c046b7e85a5e18dcb..466ff2f004c8f533355523da9120ae866d9b936a 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1296,7 +1296,14 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     @VisibleForTesting
+     public void tickPrecipitation(BlockPos pos) {
+         BlockPos heightmapPos = this.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, pos);
+         BlockPos blockPos = heightmapPos.below();
++        // Leaf start - Skip precipitation ticks without rain or water (PR #988)
++        if (!this.isRaining()) {
++            final net.minecraft.world.level.block.state.BlockState belowState = this.getBlockState(blockPos);
++            if (!(belowState.getFluidState().is(net.minecraft.world.level.material.Fluids.WATER) && belowState.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock)) {
++                return;
++            }
++        }
++        // Leaf end - Skip precipitation ticks without rain or water (PR #988)
+         Biome biome = this.getBiome(heightmapPos).value();
+         if (biome.shouldFreeze(this, blockPos)) {
+             org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(this, blockPos, Blocks.ICE.defaultBlockState(), Block.UPDATE_ALL, null); // CraftBukkit

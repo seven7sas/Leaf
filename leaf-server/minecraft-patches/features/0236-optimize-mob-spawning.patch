@@ -94,15 +94,21 @@ index b295a8b383a3d572e0c499fc0ea27ae1a95f9c06..98fbf6f42ba16436a628ef382e40987d
 +                final int mapped = distanceManager.getNaturalSpawnChunkCount();
 +                final Iterable<Entity> entities = this.level.getAllEntities();
 +                level.getServer().mobSpawnExecutor.submit(() -> {
-+                    // This ensures the caps are properly enforced by using the correct calculator
-+                    lastSpawnState = NaturalSpawner.createStateAsync( // Leaf - optimize mob spawning
-+                        mapped,
-+                        entities,
-+                        this.level
-+                    );
++                    try {
++                        // This ensures the caps are properly enforced by using the correct calculator
++                        lastSpawnState = NaturalSpawner.createStateAsync( // Leaf - optimize mob spawning
++                            mapped,
++                            entities,
++                            this.level
++                        );
++                    } catch (Throwable t) {
++                        lastSpawnState = null;
++                        LOGGER.error("Async mob spawn state calculation failed", t);
++                    } finally {
++                        _pufferfish_spawnCountsReady.set(true);
++                    }
 +                    // Leaf end - optimize mob spawning
-                     _pufferfish_spawnCountsReady.set(true);
-                 });
++                });
              }
 @@ -564,6 +543,24 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
          // Pufferfish end

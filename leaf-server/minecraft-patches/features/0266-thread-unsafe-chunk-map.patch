@@ -93,11 +93,17 @@ index eab55492d4132731f99af4f3b0266c11e639baee..b8b1a3930ffe59445a49870eed3b7ec6
                              ca.spottedleaf.moonrise.common.util.TickThread.ServerLevelTickThread currentThread = (ca.spottedleaf.moonrise.common.util.TickThread.ServerLevelTickThread) Thread.currentThread();
                              currentThread.currentTickingServerLevel = serverLevel;
  
-@@ -1969,7 +1971,9 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -1969,7 +1971,15 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
              }
  
              while (!tasks.isEmpty()) {
 -                tasks.poll().get();
++                java.util.concurrent.Future<ServerLevel> task = tasks.peek();
++                if (!task.isDone()) {
++                    this.runAllTasks(); // Leaf - SparklyPaper - pump event loop to prevent deadlocks (e.g. respawn / teleports)
++                    java.util.concurrent.locks.LockSupport.parkNanos(50_000L); // 50 us
++                    continue;
++                }
 +                final ServerLevel serverLevel = tasks.poll().get(); // Leaf - thread unsafe chunk map
 +                serverLevel.getChunkSource().fullChunksNonSync.setThread(); // Leaf - thread unsafe chunk map
 +                serverLevel.moonrise$getChunkTaskScheduler().chunkHolderManager.chunkHoldersNoSync.setThread(); // Leaf - thread unsafe chunk map
