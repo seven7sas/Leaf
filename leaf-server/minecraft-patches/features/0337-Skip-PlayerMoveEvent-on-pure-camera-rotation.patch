@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Sun, 8 Nov 2026 01:40:00 +0300
+Subject: [PATCH] Skip PlayerMoveEvent on pure camera rotation
+
+Avoids allocating Location instances and dispatching PlayerMoveEvent when
+the player only rotated their camera without spatial movement, saving
+significant MSPT and GC allocations under high player counts.
+
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index b18e11a37829188e1a8a29182390123981293812..c289182938192839182938192839182938192839 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -711,7 +711,8 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+ 
+                     if (this.lastYaw != prevEventYaw || this.lastPitch != prevEventPitch || delta > 1f / 256) this.player.resetLastActionTime(); // Purpur - AFK API
+ 
+-                    if (PlayerMoveEvent.getHandlerList().getRegisteredListeners().length != 0) {
++                    boolean shouldFire = !org.dreeam.leaf.config.modules.opt.OptimizePlayerMovementProcessing.skipEventOnRotationOnly || delta > 1f / 256;
++                    if (shouldFire && PlayerMoveEvent.getHandlerList().getRegisteredListeners().length != 0) {
+                         org.bukkit.World world = player.getWorld();
+                         Location from = new Location(world, prevEventX, prevEventY, prevEventZ, prevEventYaw, prevEventPitch);
+                         Location to = new Location(world, targetX, targetY, targetZ, targetYaw, targetPitch);
+@@ -1744,7 +1745,8 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+ 
+                                         if (this.lastYaw != prevEventYaw || this.lastPitch != prevEventPitch || delta > 1f / 256) this.player.resetLastActionTime(); // Purpur - AFK API
+ 
+-                                        if (PlayerMoveEvent.getHandlerList().getRegisteredListeners().length != 0) {
++                                        boolean shouldFire = !org.dreeam.leaf.config.modules.opt.OptimizePlayerMovementProcessing.skipEventOnRotationOnly || delta > 1f / 256;
++                                        if (shouldFire && PlayerMoveEvent.getHandlerList().getRegisteredListeners().length != 0) {
+                                             org.bukkit.World world = player.getWorld();
+                                             Location from = new Location(world, prevEventX, prevEventY, prevEventZ, prevEventYaw, prevEventPitch);
+                                             Location to = new Location(world, targetX, targetY, targetZ, targetYaw, targetPitch);
