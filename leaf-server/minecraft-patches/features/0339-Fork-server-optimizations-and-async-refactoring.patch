@@ -1,0 +1,2401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Wed, 11 Nov 2026 02:00:01 +0300
+Subject: [PATCH] Fork server optimizations and async refactoring
+
+- Async player.dat, stats and advancements login preloading and CriterionTrigger.Listener hashCode caching
+
+- Lock-free async entity lookup in ServerLevel and ChunkEntitySlices plus O(1) PoiType lookup and PoiManager direct loop
+
+- Parallel brain sensing, parallel entity collisions, lazy container item loading and cached PalettedContainerFactory
+
+- Smooth chunk send ramp-up without area-map shrinking and ChunkMap tracked entities optimization
+
+Copyright (c) 2026 seven7sas (Fork Leaf - https://github.com/seven7sas/Leaf)
+SPDX-License-Identifier: GPL-3.0-only
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+index 09dd84d9866a3bbb7282b3277be99a5c16cb0a74..f71dea9e3f46ea62ab604ccba5f9661a1f0cd766 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+@@ -367,7 +367,7 @@ public final class ChunkEntitySlices {
+             for (int i = 0, len = Math.min(storage.length, sectionEntities.size()); i < len; ++i) {
+                 final Entity entity = storage[i];
+ 
+-                if (clazz.isInstance(entity)) {
++                if (entity != null && clazz.isInstance(entity)) {
+                     ret.addEntity(entity, sectionIndex);
+                 }
+             }
+@@ -381,9 +381,11 @@ public final class ChunkEntitySlices {
+         EntityCollectionBySection collection = this.entitiesByClass.get(clazz);
+         if (collection != null) {
+             collection.getEntities(except, box, (List)into, (Predicate)predicate);
+-        } else {
++        } else if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThread()) {
+             this.entitiesByClass.put(clazz, collection = this.initClass(clazz));
+             collection.getEntities(except, box, (List)into, (Predicate)predicate);
++        } else {
++            this.allEntities.getEntities(except, box, (List)into, entity -> clazz.isInstance(entity) && (predicate == null || predicate.test((T)entity)));
+         }
+     }
+ 
+@@ -392,9 +394,11 @@ public final class ChunkEntitySlices {
+         EntityCollectionBySection collection = this.entitiesByClass.get(clazz);
+         if (collection != null) {
+             return collection.getEntitiesLimited(except, box, (List)into, (Predicate)predicate, maxCount);
+-        } else {
++        } else if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThread()) {
+             this.entitiesByClass.put(clazz, collection = this.initClass(clazz));
+             return collection.getEntitiesLimited(except, box, (List)into, (Predicate)predicate, maxCount);
++        } else {
++            return this.allEntities.getEntitiesLimited(except, box, (List)into, entity -> clazz.isInstance(entity) && (predicate == null || predicate.test((T)entity)), maxCount);
+         }
+     }
+ 
+@@ -402,8 +406,8 @@ public final class ChunkEntitySlices {
+ 
+         private static final int DEFAULT_CAPACITY = 4;
+ 
+-        private E[] storage;
+-        private int size;
++        private volatile E[] storage;
++        private volatile int size;
+         // Sakura start - use methods from EntityList
+         private it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap entityToIndex = null;
+         private void setupIndexMap() {
+@@ -494,7 +498,7 @@ public final class ChunkEntitySlices {
+ 
+         private final ChunkEntitySlices slices;
+         private final BasicEntityList<Entity>[] entitiesBySection;
+-        private int count;
++        private volatile int count;
+ 
+         public EntityCollectionBySection(final ChunkEntitySlices slices) {
+             this.slices = slices;
+@@ -563,7 +567,7 @@ public final class ChunkEntitySlices {
+                 }
+ 
+                 final Entity[] storage = list.storage;
+-                final int len = Math.min(storage.length, list.size());
++                final int len = Math.min(list.size(), storage.length);
+ 
+                 for (int i = 0; i < len; ++i) {
+                     final Entity entity = storage[i];
+@@ -573,8 +577,8 @@ public final class ChunkEntitySlices {
+                     }
+ 
+                     // Inline AABB#intersects to avoid a method call and use the cached AABB fields.
+-                    final AABB entityBB = entity.getBoundingBox();
+-                    if (entityBB.maxX <= boxMinX || entityBB.minX >= boxMaxX || entityBB.maxY <= boxMinY || entityBB.minY >= boxMaxY || entityBB.maxZ <= boxMinZ || entityBB.minZ >= boxMaxZ) {
++                    final AABB entityBox = entity.getBoundingBox();
++                    if (entityBox == null || entityBox.maxX <= boxMinX || entityBox.minX >= boxMaxX || entityBox.maxY <= boxMinY || entityBox.minY >= boxMaxY || entityBox.maxZ <= boxMinZ || entityBox.minZ >= boxMaxZ) {
+                         // Leaf end - Optimise getEntities
+                         continue;
+                     }
+@@ -618,7 +622,7 @@ public final class ChunkEntitySlices {
+                 }
+ 
+                 final Entity[] storage = list.storage;
+-                final int len = Math.min(storage.length, list.size());
++                final int len = Math.min(list.size(), storage.length);
+ 
+                 for (int i = 0; i < len; ++i) {
+                     final Entity entity = storage[i];
+@@ -627,8 +631,8 @@ public final class ChunkEntitySlices {
+                     }
+ 
+                     // Inline AABB#intersects to avoid a method call and use the cached AABB fields.
+-                    final AABB entityBB = entity.getBoundingBox();
+-                    if (entityBB.maxX <= boxMinX || entityBB.minX >= boxMaxX || entityBB.maxY <= boxMinY || entityBB.minY >= boxMaxY || entityBB.maxZ <= boxMinZ || entityBB.minZ >= boxMaxZ) {
++                    final AABB entityBox = entity.getBoundingBox();
++                    if (entityBox == null || entityBox.maxX <= boxMinX || entityBox.minX >= boxMaxX || entityBox.maxY <= boxMinY || entityBox.minY >= boxMaxY || entityBox.maxZ <= boxMinZ || entityBox.minZ >= boxMaxZ) {
+                         // Leaf end - Optimise getEntities
+                         continue;
+                     }
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index 0a6fbbe4097ea3619f5b2601d38ac13543642e31..1797e1d57a3f9d4fb55f0c6a9c7df3f9c61d59bf 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -315,6 +315,7 @@ public final class RegionizedPlayerChunkLoader {
+             }
+             loader.update(); // can't invoke plugin logic
+             loader.updateQueues(currTime);
++            loader.advanceSpawnRamp(); // Leaf - Smooth chunk send ramp-up on spawn / teleport
+         }
+     }
+ 
+@@ -397,6 +398,11 @@ public final class RegionizedPlayerChunkLoader {
+ 
+         private volatile boolean removed;
+         private final org.dreeam.leaf.async.chunk.AsyncChunkSender asyncSender = org.dreeam.leaf.config.modules.async.AsyncChunkSend.enabled ? new org.dreeam.leaf.async.chunk.AsyncChunkSender() : null; // Leaf - async chunk sender
++        // Leaf start - Smooth chunk send ramp-up on spawn / teleport
++        private static final int RAMP_DURATION_TICKS = 8;
++        private boolean rampingUp = false;
++        private int rampTickCount = 0;
++        // Leaf end - Smooth chunk send ramp-up on spawn / teleport
+ 
+         public PlayerChunkLoaderData(final ServerLevel world, final ServerPlayer player) {
+             this.world = world;
+@@ -735,7 +741,10 @@ public final class RegionizedPlayerChunkLoader {
+             }
+ 
+             // try to push more chunk loads
+-            final long maxLoads = Math.max(0L, Math.min(MAX_RATE, Math.min(this.loadQueue.size(), this.getMaxChunkLoads())));
++            // Leaf start - Smooth chunk send ramp-up: cap per-tick load promotions during spawn/teleport
++            final long rampLoadCap = this.rampingUp ? (16L + (long)this.rampTickCount * 12L) : MAX_RATE;
++            final long maxLoads = Math.max(0L, Math.min(rampLoadCap, Math.min(MAX_RATE, Math.min(this.loadQueue.size(), this.getMaxChunkLoads()))));
++            // Leaf end
+             final int maxLoadsThisTick = (int)this.chunkLoadTicketLimiter.takeAllocation(time, loadRate, maxLoads);
+             if (maxLoadsThisTick > 0) {
+                 final LongArrayList chunks = new LongArrayList(maxLoadsThisTick);
+@@ -814,7 +823,14 @@ public final class RegionizedPlayerChunkLoader {
+             // preview the allocations, as we may not actually utilise all of them
+             final long maxGensThisTick = this.chunkGenerateTicketLimiter.previewAllocation(time, genRate, maxGens);
+             long ratedGensThisTick = 0L;
++            // Leaf start - Smooth chunk send ramp-up: cap per-tick pre-generated chunk promotions during spawn/teleport
++            final int maxRampGenPromote = this.rampingUp ? (16 + this.rampTickCount * 8) : Integer.MAX_VALUE;
++            int totalGensPromoted = 0;
++            // Leaf end
+             while (!this.genQueue.isEmpty()) {
++                if (totalGensPromoted >= maxRampGenPromote) { // Leaf - Smooth chunk send ramp-up
++                    break;
++                }
+                 final long chunkKey = this.genQueue.firstLong();
+                 final int chunkX = CoordinateUtils.getChunkX(chunkKey);
+                 final int chunkZ = CoordinateUtils.getChunkZ(chunkKey);
+@@ -827,6 +843,7 @@ public final class RegionizedPlayerChunkLoader {
+                     ++ratedGensThisTick;
+                 }
+ 
++                totalGensPromoted++; // Leaf - Smooth chunk send ramp-up
+                 this.genQueue.dequeueLong();
+ 
+                 final byte prev = this.chunkTicketStage.put(chunkKey, CHUNK_TICKET_STAGE_GENERATING);
+@@ -846,7 +863,14 @@ public final class RegionizedPlayerChunkLoader {
+             this.chunkGenerateTicketLimiter.takeAllocation(time, genRate, ratedGensThisTick);
+ 
+             // try to pull ticking chunks
++            // Leaf start - Smooth chunk send ramp-up: distribute BlockEntity/entity activation across initial ticks
++            final int maxRampTickPromote = this.rampingUp ? (9 + this.rampTickCount * 8) : Integer.MAX_VALUE;
++            int totalTickPromoted = 0;
++            // Leaf end
+             while (!this.tickingQueue.isEmpty()) {
++                if (totalTickPromoted >= maxRampTickPromote) { // Leaf - Smooth chunk send ramp-up
++                    break;
++                }
+                 final long pendingTicking = this.tickingQueue.firstLong();
+                 final int pendingChunkX = CoordinateUtils.getChunkX(pendingTicking);
+                 final int pendingChunkZ = CoordinateUtils.getChunkZ(pendingTicking);
+@@ -857,6 +881,7 @@ public final class RegionizedPlayerChunkLoader {
+                 }
+ 
+                 // only gets here if all neighbours were marked as generated or ticking themselves
++                totalTickPromoted++; // Leaf - Smooth chunk send ramp-up
+                 this.tickingQueue.dequeueLong();
+                 this.pushDelayedTicketOp(
+                     ChunkHolderManager.TicketOperation.addAndRemove(
+@@ -874,7 +899,15 @@ public final class RegionizedPlayerChunkLoader {
+ 
+             // try to pull sending chunks
+             final long maxSends = Math.max(0L, Math.min(MAX_RATE, Integer.MAX_VALUE)); // note: no logic to track concurrent sends
+-            final int maxSendsThisTick = Math.min((int)this.chunkSendLimiter.takeAllocation(time, sendRate, maxSends), this.sendQueue.size());
++            int maxSendsThisTick = Math.min((int)this.chunkSendLimiter.takeAllocation(time, sendRate, maxSends), this.sendQueue.size());
++            // Leaf start - Smooth chunk send ramp-up: start with 9 priority chunks on spawn tick and expand smoothly
++            if (this.rampingUp) {
++                final int rampSendCap = 9 + this.rampTickCount * 8;
++                if (maxSendsThisTick > rampSendCap) {
++                    maxSendsThisTick = rampSendCap;
++                }
++            }
++            // Leaf end
+             // we do not return sends that we took from the allocation back because we want to limit the max send rate, not target it
+             for (int i = 0; i < maxSendsThisTick; ++i) {
+                 final long pendingSend = this.sendQueue.firstLong();
+@@ -952,7 +985,17 @@ public final class RegionizedPlayerChunkLoader {
+             this.player.connection.send(this.updateClientChunkRadius(sendViewDistance));
+             this.player.connection.send(this.updateClientSimulationDistance(tickViewDistance));
+ 
+-            // add to distance maps
++            // Leaf start - Smooth chunk send ramp-up on join / dimension change (full distances in area maps, ramp-up in queues)
++            if (org.dreeam.leaf.config.modules.opt.PredictiveChunkConfig.smoothSpawnRampUp) {
++                this.rampingUp = true;
++                this.rampTickCount = 0;
++            } else {
++                this.rampingUp = false;
++                this.rampTickCount = 0;
++            }
++            // Leaf end
++
++            // add to distance maps using full target distances
+             this.broadcastMap.add(chunkX, chunkZ, sendViewDistance + 1);
+             this.loadTicketCleanup.add(chunkX, chunkZ, loadViewDistance + 1);
+             this.tickMap.add(chunkX, chunkZ, tickViewDistance);
+@@ -983,6 +1026,21 @@ public final class RegionizedPlayerChunkLoader {
+             );
+         }
+ 
++        // Leaf start - Smooth chunk send ramp-up advance per tick
++        void advanceSpawnRamp() {
++            if (!this.rampingUp) {
++                return;
++            }
++            if (!org.dreeam.leaf.config.modules.opt.PredictiveChunkConfig.smoothSpawnRampUp
++                || this.rampTickCount >= RAMP_DURATION_TICKS
++                || (this.loadQueue.isEmpty() && this.genQueue.isEmpty() && this.tickingQueue.isEmpty() && this.sendQueue.isEmpty())) {
++                this.rampingUp = false;
++                return;
++            }
++            this.rampTickCount++;
++        }
++        // Leaf end
++
+         void update() {
+             TickThread.ensureTickThread(this.player, "Cannot update player asynchronously");
+             if (this.removed) {
+@@ -1026,6 +1084,15 @@ public final class RegionizedPlayerChunkLoader {
+                 return;
+             }
+ 
++            // Leaf start - Smooth chunk send ramp-up on teleport > 4 chunks (queue-only cap, no map shrinking or limiter reset)
++            if (prevChunkX != Integer.MIN_VALUE
++                && org.dreeam.leaf.config.modules.opt.PredictiveChunkConfig.smoothSpawnRampUp
++                && (Math.abs(prevChunkX - currentChunkX) > 4 || Math.abs(prevChunkZ - currentChunkZ) > 4)) {
++                this.rampingUp = true;
++                this.rampTickCount = 0;
++            }
++            // Leaf end
++
+             // update distance maps
+             this.broadcastMap.update(currentChunkX, currentChunkZ, sendViewDistance + 1);
+             this.loadTicketCleanup.update(currentChunkX, currentChunkZ, loadViewDistance + 1);
+diff --git a/net/minecraft/advancements/Criterion.java b/net/minecraft/advancements/Criterion.java
+index b62dfd6fa8e51e4fc59a175cf9eaeed6b40833c1..5dfb4aefd400d95efb243b9d30b32d2866b62eda 100644
+--- a/net/minecraft/advancements/Criterion.java
++++ b/net/minecraft/advancements/Criterion.java
+@@ -5,6 +5,13 @@ import com.mojang.serialization.MapCodec;
+ import net.minecraft.util.ExtraCodecs;
+ 
+ public record Criterion<T extends CriterionTriggerInstance>(CriterionTrigger<T> trigger, T triggerInstance) {
++    // Leaf start - Eagerly link TriggerInstance hashCode bootstrap at datapack load
++    public Criterion {
++        if (triggerInstance != null) {
++            triggerInstance.hashCode();
++        }
++    }
++    // Leaf end - Eagerly link TriggerInstance hashCode bootstrap at datapack load
+     private static final MapCodec<Criterion<?>> MAP_CODEC = ExtraCodecs.dispatchOptionalValue(
+         "trigger", "conditions", CriteriaTriggers.CODEC, Criterion::trigger, Criterion::criterionCodec
+     );
+diff --git a/net/minecraft/advancements/CriterionTrigger.java b/net/minecraft/advancements/CriterionTrigger.java
+index d2f01babfe551b6c227b83bcffd59144b9c7173c..7efc2c975f3435b60a55bef94ef9adad1999965e 100644
+--- a/net/minecraft/advancements/CriterionTrigger.java
++++ b/net/minecraft/advancements/CriterionTrigger.java
+@@ -16,9 +16,59 @@ public interface CriterionTrigger<T extends CriterionTriggerInstance> {
+         return new Criterion<>(this, triggerInstance);
+     }
+ 
+-    public record Listener<T extends CriterionTriggerInstance>(T trigger, AdvancementHolder advancement, String criterion) {
++    // Leaf start - Precompute Listener hashCode to avoid predicate record hashing on join
++    public static final class Listener<T extends CriterionTriggerInstance> {
++        private final T trigger;
++        private final AdvancementHolder advancement;
++        private final String criterion;
++        private final int cachedHashCode;
++
++        public Listener(T trigger, AdvancementHolder advancement, String criterion) {
++            this.trigger = trigger;
++            this.advancement = advancement;
++            this.criterion = criterion;
++            this.cachedHashCode = 31 * java.util.Objects.hashCode(advancement) + java.util.Objects.hashCode(criterion);
++        }
++
++        public T trigger() {
++            return this.trigger;
++        }
++
++        public AdvancementHolder advancement() {
++            return this.advancement;
++        }
++
++        public String criterion() {
++            return this.criterion;
++        }
++
+         public void run(PlayerAdvancements playerAdvancements) {
+             playerAdvancements.award(this.advancement, this.criterion);
+         }
++
++        @Override
++        public boolean equals(Object obj) {
++            if (this == obj) {
++                return true;
++            }
++            if (!(obj instanceof CriterionTrigger.Listener<?> other)) {
++                return false;
++            }
++            return this.cachedHashCode == other.cachedHashCode
++                && java.util.Objects.equals(this.trigger, other.trigger)
++                && java.util.Objects.equals(this.advancement, other.advancement)
++                && java.util.Objects.equals(this.criterion, other.criterion);
++        }
++
++        @Override
++        public int hashCode() {
++            return this.cachedHashCode;
++        }
++
++        @Override
++        public String toString() {
++            return "Listener[trigger=" + this.trigger + ", advancement=" + this.advancement + ", criterion=" + this.criterion + "]";
++        }
+     }
++    // Leaf end - Precompute Listener hashCode to avoid predicate record hashing on join
+ }
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 0033300feb485f08ab6dd5cd910426dceec35ae8..cc031f1508d1092137e94d155cd840c5db42e117 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -413,6 +413,18 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         }
+     }
+ 
++    // Leaf start - Purpur lagging check optimization - compute only 5s window
++    private double getTPS5s() {
++        synchronized (this.statsLock) {
++            final double[] tps5s = this.tps5s;
++            if (tps5s != null) {
++                return tps5s[0];
++            }
++            return getTPS(this.tickTimes5s, this.tickRateManager().nanosecondsPerTick());
++        }
++    }
++    // Leaf end - Purpur lagging check optimization - compute only 5s window
++
+     public double[] computeTPSIncluding5Seconds() {
+         final long interval = this.tickRateManager().nanosecondsPerTick();
+         return new double[] {
+@@ -1403,7 +1415,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+                         org.purpurmc.purpur.PurpurConfig.tpsCatchup ? 5 : 1 //ConfigHolder.getConfig().tickLoop.catchupTicks.getOrDefault(MoonriseConfig.TickLoop.DEFAULT_CATCHUP_TICKS).intValue() // Purpur - Configurable TPS Catchup
+                     );
+ 
+-                    lagging = getTPSIncluding5SecondsReadOnly()[0] < org.purpurmc.purpur.PurpurConfig.laggingThreshold; // Purpur - Lagging threshold // Gale - Purpur - 5 second TPS average
++                    lagging = this.getTPS5s() < org.purpurmc.purpur.PurpurConfig.laggingThreshold; // Purpur - Lagging threshold // Gale - Purpur - 5 second TPS average // Leaf - compute only 5s window
+ 
+                     // adjust ticksBehind so that it is not greater-than catchup
+                     if (ticksBehind > catchup) {
+@@ -1977,9 +1989,26 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             }
+         } catch (java.lang.InterruptedException | java.util.concurrent.ExecutionException e) {
+             throw new RuntimeException(e); // Propagate exception
++        } finally {
++            // Leaf start - thread unsafe chunk map - drain remaining world tasks and restore main thread ownership
++            while (!tasks.isEmpty()) {
++                try {
++                    final ServerLevel serverLevel = tasks.poll().get();
++                    serverLevel.getChunkSource().fullChunksNonSync.setThread();
++                    serverLevel.moonrise$getChunkTaskScheduler().chunkHolderManager.chunkHoldersNoSync.setThread();
++                } catch (Throwable ignored) {
++                }
++            }
++            if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) {
++                for (ServerLevel serverLevel : this.getAllLevels()) {
++                    serverLevel.getChunkSource().fullChunksNonSync.setThread();
++                    serverLevel.moonrise$getChunkTaskScheduler().chunkHolderManager.chunkHoldersNoSync.setThread();
++                }
++            }
++            this.isIteratingOverLevels = false; // Paper - Throw exception on world create while being ticked
++            // Leaf end - thread unsafe chunk map
+         }
+         // Leaf end - SparklyPaper - parallel world ticking
+-        this.isIteratingOverLevels = false; // Paper - Throw exception on world create while being ticked
+ 
+         if (org.dreeam.leaf.config.modules.async.MultithreadedTracker.enabled) { for (ServerLevel world : getAllLevels()) { world.leaf$asyncTracker.onTickEnd(); } } // Leaf - Multithreaded tracker
+ 
+diff --git a/net/minecraft/server/PlayerAdvancements.java b/net/minecraft/server/PlayerAdvancements.java
+index 9f8dc80f279e2fa6e4c7a292c6239dc5fe9ee15f..f0851b4c3c63544da87c4f6b14b757f308df642f 100644
+--- a/net/minecraft/server/PlayerAdvancements.java
++++ b/net/minecraft/server/PlayerAdvancements.java
+@@ -62,15 +62,97 @@ public class PlayerAdvancements {
+     private boolean isFirstPacket = true;
+     private final Codec<PlayerAdvancements.Data> codec;
+     public final Map<net.minecraft.advancements.criterion.SimpleCriterionTrigger<?>, Set<CriterionTrigger.Listener<?>>> criterionData = new java.util.IdentityHashMap<>(); // Paper - fix advancement data player leakage // Leaf - Remove stream in CraftWorld#spawnParticle - diff on change
++    // Leaf start - Async player advancements preloading during login handshake
++    private record CachedCodec(DataFixer fixer, Codec<PlayerAdvancements.Data> codec) {}
++    private record PreloadedAdvancements(Path path, @Nullable Data data) {}
++    private static volatile @Nullable CachedCodec CACHED_CODEC;
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, PreloadedAdvancements> PRELOADED_ADVANCEMENTS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, Long> PRELOADED_TIMESTAMPS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedAdvancements>>> PRELOAD_FUTURES = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, java.util.concurrent.atomic.AtomicLong> SAVE_GENERATIONS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final long PRELOAD_TTL_MS = 120_000L;
++
++    private static Codec<PlayerAdvancements.Data> getWrappedCodec(DataFixer dataFixer) {
++        CachedCodec cached = CACHED_CODEC;
++        if (cached != null && cached.fixer() == dataFixer) {
++            return cached.codec();
++        }
++        Codec<PlayerAdvancements.Data> wrapped = DataFixTypes.ADVANCEMENTS.wrapCodec(PlayerAdvancements.Data.CODEC, dataFixer, 1343);
++        CACHED_CODEC = new CachedCodec(dataFixer, wrapped);
++        return wrapped;
++    }
++
++    public static void clearPreloaded(java.util.@Nullable UUID uuid) {
++        if (uuid == null) {
++            return;
++        }
++        PRELOADED_ADVANCEMENTS.remove(uuid);
++        PRELOADED_TIMESTAMPS.remove(uuid);
++        java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedAdvancements>> future = PRELOAD_FUTURES.remove(uuid);
++        if (future != null) {
++            future.cancel(false);
++        }
++    }
++
++    public static void preloadAsync(MinecraftServer server, java.util.UUID uuid, java.util.concurrent.Executor executor) {
++        if (server.getPlayerList().getPlayer(uuid) != null) {
++            clearPreloaded(uuid);
++            return;
++        }
++        if (PRELOADED_ADVANCEMENTS.size() > 256) {
++            long cutoff = System.currentTimeMillis() - PRELOAD_TTL_MS;
++            PRELOADED_TIMESTAMPS.forEach((k, ts) -> {
++                if (ts < cutoff) {
++                    clearPreloaded(k);
++                }
++            });
++        }
++
++        Path advancementsPath = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.PLAYER_ADVANCEMENTS_DIR).resolve(uuid + ".json");
++        Codec<PlayerAdvancements.Data> advancementCodec = getWrappedCodec(server.getFixerUpper());
++        long genAtStart = SAVE_GENERATIONS.computeIfAbsent(uuid, k -> new java.util.concurrent.atomic.AtomicLong()).get();
++        java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedAdvancements>> future = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
++            org.dreeam.leaf.async.AsyncPlayerDataSaving.awaitPendingSave(uuid);
++            PlayerAdvancements.Data parsed = parseAdvancementData(advancementCodec, advancementsPath);
++            java.util.concurrent.atomic.AtomicLong gen = SAVE_GENERATIONS.get(uuid);
++            if ((gen == null || gen.get() == genAtStart) && server.getPlayerList().getPlayer(uuid) == null) {
++                PreloadedAdvancements entry = new PreloadedAdvancements(advancementsPath, parsed);
++                PRELOADED_TIMESTAMPS.put(uuid, System.currentTimeMillis());
++                PRELOADED_ADVANCEMENTS.put(uuid, entry);
++                return java.util.Optional.of(entry);
++            }
++            return java.util.Optional.empty();
++        }, executor);
++
++        java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedAdvancements>> prev = PRELOAD_FUTURES.put(uuid, future);
++        if (prev != null && !prev.isDone()) {
++            prev.cancel(false);
++        }
++        future.whenComplete((res, ex) -> PRELOAD_FUTURES.remove(uuid, future));
++    }
++
++    private static @Nullable Data parseAdvancementData(Codec<PlayerAdvancements.Data> codec, Path path) {
++        if (Files.isRegularFile(path)) {
++            try (Reader bufferedReader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
++                JsonElement jsonElement = StrictJsonParser.parse(bufferedReader);
++                return codec.parse(JsonOps.INSTANCE, jsonElement).getOrThrow(JsonParseException::new);
++            } catch (JsonIOException | IOException var7) {
++                LOGGER.error("Couldn't access player advancements in {}", path, var7);
++            } catch (JsonParseException var8) {
++                LOGGER.error("Couldn't parse player advancements in {}", path, var8);
++            }
++        }
++        return null;
++    }
++    // Leaf end - Async player advancements preloading during login handshake
+ 
+     public PlayerAdvancements(DataFixer dataFixer, PlayerList playerList, ServerAdvancementManager manager, Path playerSavePath, ServerPlayer player) {
+         this.playerList = playerList;
+         this.playerSavePath = playerSavePath;
+         this.player = player;
+         this.tree = manager.tree();
+-        int i = 1343;
+-        this.codec = DataFixTypes.ADVANCEMENTS.wrapCodec(PlayerAdvancements.Data.CODEC, dataFixer, 1343);
+-        this.load(manager);
++        this.codec = getWrappedCodec(dataFixer); // Leaf - Reuse cached advancement codec wrapper
++        this.load(manager, true);
+     }
+ 
+     public void setPlayer(ServerPlayer player) {
+@@ -92,7 +174,7 @@ public class PlayerAdvancements {
+         this.isFirstPacket = true;
+         this.lastSelectedTab = null;
+         this.tree = manager.tree();
+-        this.load(manager);
++        this.load(manager, false);
+     }
+ 
+     private void registerListeners(ServerAdvancementManager manager) {
+@@ -111,18 +193,40 @@ public class PlayerAdvancements {
+         }
+     }
+ 
+-    private void load(ServerAdvancementManager manager) {
+-        if (Files.isRegularFile(this.playerSavePath)) {
+-            try (Reader bufferedReader = Files.newBufferedReader(this.playerSavePath, StandardCharsets.UTF_8)) {
+-                JsonElement jsonElement = StrictJsonParser.parse(bufferedReader);
+-                PlayerAdvancements.Data data = this.codec.parse(JsonOps.INSTANCE, jsonElement).getOrThrow(JsonParseException::new);
+-                this.applyFrom(manager, data);
+-            } catch (JsonIOException | IOException var7) {
+-                LOGGER.error("Couldn't access player advancements in {}", this.playerSavePath, var7);
+-            } catch (JsonParseException var8) {
+-                LOGGER.error("Couldn't parse player advancements in {}", this.playerSavePath, var8);
++    private void load(ServerAdvancementManager manager, boolean usePreloaded) {
++        // Leaf start - Consume asynchronously preloaded advancements if valid
++        PreloadedAdvancements preloadedEntry = null;
++        if (usePreloaded && this.player != null) {
++            java.util.UUID uuid = this.player.getUUID();
++            PreloadedAdvancements cached = PRELOADED_ADVANCEMENTS.remove(uuid);
++            Long loadedAt = PRELOADED_TIMESTAMPS.remove(uuid);
++            if (cached != null) {
++                PRELOAD_FUTURES.remove(uuid);
++                if (cached.path().equals(this.playerSavePath) && (loadedAt == null || (System.currentTimeMillis() - loadedAt) <= PRELOAD_TTL_MS)) {
++                    preloadedEntry = cached;
++                }
++            } else {
++                java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedAdvancements>> inFlight = PRELOAD_FUTURES.remove(uuid);
++                if (inFlight != null && !inFlight.isCancelled()) {
++                    try {
++                        PreloadedAdvancements resolved = inFlight.get().orElse(null);
++                        PRELOADED_ADVANCEMENTS.remove(uuid);
++                        PRELOADED_TIMESTAMPS.remove(uuid);
++                        if (resolved != null && resolved.path().equals(this.playerSavePath)) {
++                            preloadedEntry = resolved;
++                        }
++                    } catch (Exception ignored) {
++                    }
++                }
+             }
+         }
++        PlayerAdvancements.Data data = preloadedEntry != null
++            ? preloadedEntry.data()
++            : parseAdvancementData(this.codec, this.playerSavePath);
++        if (data != null) {
++            this.applyFrom(manager, data);
++        }
++        // Leaf end - Consume asynchronously preloaded advancements if valid
+ 
+         this.checkForAutomaticTriggers(manager);
+         this.registerListeners(manager);
+@@ -131,17 +235,25 @@ public class PlayerAdvancements {
+     public void save() {
+         if (org.spigotmc.SpigotConfig.disableAdvancementSaving) return; // Spigot
+         if (org.dreeam.leaf.config.modules.misc.RegionFormatConfig.isReadOnlyMode()) return; // Leaf - Add read-only mode for Linear v2
+-        JsonElement jsonElement = this.codec.encodeStart(JsonOps.INSTANCE, this.asData()).getOrThrow();
++        final java.util.UUID uuid = this.player != null ? this.player.getUUID() : null;
++        if (uuid != null) {
++            SAVE_GENERATIONS.computeIfAbsent(uuid, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
++            clearPreloaded(uuid);
++        }
++        final JsonElement jsonElement = this.codec.encodeStart(JsonOps.INSTANCE, this.asData()).getOrThrow();
++        final Path savePath = this.playerSavePath;
+ 
+-        try {
+-            FileUtil.createDirectoriesSafe(this.playerSavePath.getParent());
++        org.dreeam.leaf.async.AsyncPlayerDataSaving.submitPlayerSave(uuid, () -> {
++            try {
++                FileUtil.createDirectoriesSafe(savePath.getParent());
+ 
+-            try (Writer bufferedWriter = Files.newBufferedWriter(this.playerSavePath, StandardCharsets.UTF_8)) {
+-                GSON.toJson(jsonElement, GSON.newJsonWriter(bufferedWriter));
++                try (Writer bufferedWriter = Files.newBufferedWriter(savePath, StandardCharsets.UTF_8)) {
++                    GSON.toJson(jsonElement, GSON.newJsonWriter(bufferedWriter));
++                }
++            } catch (JsonIOException | IOException var7) {
++                LOGGER.error("Couldn't save player advancements to {}", savePath, var7);
+             }
+-        } catch (JsonIOException | IOException var7) {
+-            LOGGER.error("Couldn't save player advancements to {}", this.playerSavePath, var7);
+-        }
++        });
+     }
+ 
+     private void applyFrom(ServerAdvancementManager advancementManager, PlayerAdvancements.Data data) {
+@@ -253,6 +365,9 @@ public class PlayerAdvancements {
+     }
+ 
+     private <T extends CriterionTriggerInstance> void registerListener(AdvancementHolder advancement, String criterionKey, Criterion<T> criterion) {
++        if (criterion.trigger().getClass() == net.minecraft.advancements.criterion.ImpossibleTrigger.class) {
++            return;
++        }
+         criterion.trigger().addPlayerListener(this, new CriterionTrigger.Listener<>(criterion.triggerInstance(), advancement, criterionKey));
+     }
+ 
+@@ -268,6 +383,9 @@ public class PlayerAdvancements {
+     }
+ 
+     private <T extends CriterionTriggerInstance> void removeListener(AdvancementHolder advancement, String criterionKey, Criterion<T> criterion) {
++        if (criterion.trigger().getClass() == net.minecraft.advancements.criterion.ImpossibleTrigger.class) {
++            return;
++        }
+         criterion.trigger().removePlayerListener(this, new CriterionTrigger.Listener<>(criterion.triggerInstance(), advancement, criterionKey));
+     }
+ 
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index ace8962353cb54fce23f696157524d615c89a762..b3d625a3e4e222d0c99a5d408d96047dc7e5ccfd 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1026,11 +1026,16 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                     if (entity instanceof ServerPlayer serverPlayer) {
+                         this.updatePlayerStatus(serverPlayer, true);
+ 
+-                        for (ChunkMap.TrackedEntity trackedEntity1 : this.entityMap.values()) {
+-                            if (trackedEntity1.entity != serverPlayer) {
+-                                trackedEntity1.updatePlayer(serverPlayer);
++                        // Leaf start - Skip O(N) full-world entity scan; Moonrise/MultithreadedTracker pairs mobs via NearbyPlayers
++                        for (ServerPlayer otherPlayer : this.level.players()) {
++                            if (otherPlayer != serverPlayer) {
++                                ChunkMap.TrackedEntity trackedEntity1 = this.entityMap.get(otherPlayer.getId());
++                                if (trackedEntity1 != null) {
++                                    trackedEntity1.updatePlayer(serverPlayer);
++                                }
+                             }
+                         }
++                        // Leaf end
+                     }
+                 }
+             }
+@@ -1042,9 +1047,16 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+         if (entity instanceof ServerPlayer serverPlayer) {
+             this.updatePlayerStatus(serverPlayer, false);
+ 
+-            for (ChunkMap.TrackedEntity trackedEntity : this.entityMap.values()) {
+-                trackedEntity.removePlayer(serverPlayer);
++            // Leaf start - O(seen) cleanup instead of scanning all entityMap.values()
++            if (!serverPlayer.leaf$trackedEntities.isEmpty()) {
++                for (ChunkMap.TrackedEntity trackedEntity : serverPlayer.leaf$trackedEntities.toArray(ChunkMap.TrackedEntity[]::new)) {
++                    if (trackedEntity.seenBy.contains(serverPlayer.connection)) {
++                        trackedEntity.removePlayer(serverPlayer);
++                    }
++                }
++                serverPlayer.leaf$trackedEntities.clear();
+             }
++            // Leaf end
+         }
+ 
+         ChunkMap.TrackedEntity trackedEntity1 = this.entityMap.remove(entity.getId());
+@@ -1239,6 +1251,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             @Override
+             public boolean add(ServerPlayerConnection serverPlayerConnection) {
+                 if (super.add(serverPlayerConnection)) {
++                    serverPlayerConnection.getPlayer().leaf$trackedEntities.add(TrackedEntity.this); // Leaf - Per-player tracked entities index
+                     // for plugin compatibility
+                     TrackedEntity.this.seenByUpdated = true;
+                     return true;
+@@ -1250,6 +1263,9 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             @Override
+             public boolean remove(Object k) {
+                 if (super.remove(k)) {
++                    if (k instanceof ServerPlayerConnection conn) {
++                        conn.getPlayer().leaf$trackedEntities.remove(TrackedEntity.this); // Leaf - Per-player tracked entities index
++                    }
+                     // for plugin compatibility
+                     TrackedEntity.this.seenByUpdated = true;
+                     return true;
+@@ -1260,6 +1276,9 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+             @Override
+             public void clear() {
++                for (ServerPlayerConnection conn : this) {
++                    conn.getPlayer().leaf$trackedEntities.remove(TrackedEntity.this); // Leaf - Per-player tracked entities index
++                }
+                 TrackedEntity.this.seenByUpdated = true;
+                 super.clear();
+             }
+@@ -1268,16 +1287,25 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+         public final Set<ServerPlayerConnection> seenBy = org.dreeam.leaf.config.modules.async.MultithreadedTracker.enabled ? it.unimi.dsi.fastutil.objects.ReferenceSets.synchronize(new SeenBySet()) : new SeenBySet(); // Paper - Perf: optimise map impl
+         private volatile boolean seenByUpdated = false;
+         private volatile ServerPlayerConnection[] seenByArray = EMPTY_OBJECT_ARRAY;
++
+         public ServerPlayerConnection[] seenBy() {
+-            if (!seenByUpdated) {
+-                return seenByArray;
+-            } else {
+-                return seenBy.toArray(EMPTY_OBJECT_ARRAY);
++            if (!this.seenByUpdated) {
++                return this.seenByArray;
++            }
++            synchronized (this.seenBy) {
++                if (this.seenByUpdated) {
++                    this.seenByArray = this.seenBy.toArray(EMPTY_OBJECT_ARRAY);
++                    this.seenByUpdated = false;
++                }
++                return this.seenByArray;
+             }
+         }
++
+         public void seenByUpdated() {
+-            this.seenByArray = this.seenBy.toArray(EMPTY_OBJECT_ARRAY);
+-            seenByUpdated = false;
++            synchronized (this.seenBy) {
++                this.seenByArray = this.seenBy.toArray(EMPTY_OBJECT_ARRAY);
++                this.seenByUpdated = false;
++            }
+         }
+         // Leaf end - Multithreaded tracker
+ 
+@@ -1419,6 +1447,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+         public void broadcastRemoved() {
+             for (ServerPlayerConnection serverPlayerConnection : this.seenBy()) { // Leaf - petal - Multithreaded tracker
++                serverPlayerConnection.getPlayer().leaf$trackedEntities.remove(this); // Leaf - Per-player tracked entities index
+                 this.serverEntity.removePairing(serverPlayerConnection.getPlayer());
+             }
+         }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index acaaf7d8648bc9d55721ee35bcea619e63a26005..413bf551e01bada950e7224eadc80363821f6cf1 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1037,6 +1037,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             io.papermc.paper.entity.activation.ActivationRange.activateEntities(this); // Paper - EAR
+             boolean didDespawn = tickRateManager.runsNormally() && despawnMap.tick(this, this.entityTickList); // Leaf - optimize despawn
+             this.globalTemptationLookup.tick(this); // Paper - optimise temptation lookups - reset global cache prior to next entity tick // Leaf - Paper PR: Optimise temptation lookups changes
++            // Leaf start - Split-phase parallel collisions & off-thread brain sensing
++            org.dreeam.leaf.async.collision.ParallelCollisionDispatcher.tick(this, this.entityTickList);
++            org.dreeam.leaf.async.ai.ParallelBrainSensingDispatcher.tick(this, this.entityTickList);
++            // Leaf end - Split-phase parallel collisions & off-thread brain sensing
+             this.entityTickList
+                 .forEach(
+                     entity -> {
+@@ -1297,6 +1301,14 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     public void tickPrecipitation(BlockPos pos) {
+         BlockPos heightmapPos = this.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, pos);
+         BlockPos blockPos = heightmapPos.below();
++        // Leaf start - Skip precipitation ticks without rain or water (PR #988)
++        if (!this.isRaining()) {
++            final net.minecraft.world.level.block.state.BlockState belowState = this.getBlockState(blockPos);
++            if (!(belowState.getFluidState().is(net.minecraft.world.level.material.Fluids.WATER) && belowState.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock)) {
++                return;
++            }
++        }
++        // Leaf end - Skip precipitation ticks without rain or water (PR #988)
+         Biome biome = this.getBiome(heightmapPos).value();
+         if (biome.shouldFreeze(this, blockPos)) {
+             org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(this, blockPos, Blocks.ICE.defaultBlockState(), Block.UPDATE_ALL, null); // CraftBukkit
+@@ -2906,11 +2918,14 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         }
+     }
+ 
++    // Leaf start - Allow read-only entity access during parallel / async entity lookup
++    public volatile boolean isParallelReadPassActive = false;
++
+     @Override
+     public LevelEntityGetter<Entity> getEntities() {
+-        org.spigotmc.AsyncCatcher.catchOp("Chunk getEntities call"); // Spigot
+         return this.moonrise$getEntityLookup(); // Paper - rewrite chunk system
+     }
++    // Leaf end - Allow read-only entity access during parallel / async entity lookup
+ 
+     public void addLegacyChunkEntities(Stream<Entity> entities) {
+         // Paper start - add chunkpos param
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index 67c13021344c93049f218b9dd5a0fccba09be75d..b68920ca1996f5d6b616a8fcd4e77d061a302f39 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -471,6 +471,12 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+     // Paper end - rewrite chunk system
+ 
+     public boolean hasTickedAtLeastOnceInNewWorld = false; // Leaf - SparklyPaper - parallel world ticking (fixes bug in DreamResourceReset where the inventory is opened AFTER the player has changed worlds, if you click with the quick tp torch in a chest, because the inventory is opened AFTER the player has teleported)
++    // Leaf start - Per-player tracked entities index to avoid O(N) scan on disconnect/world switch
++    public final java.util.Set<ChunkMap.TrackedEntity> leaf$trackedEntities =
++        org.dreeam.leaf.config.modules.async.MultithreadedTracker.enabled
++            ? java.util.concurrent.ConcurrentHashMap.newKeySet()
++            : new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>();
++    // Leaf end - Per-player tracked entities index
+ 
+     public ServerPlayer(MinecraftServer server, ServerLevel level, GameProfile gameProfile, ClientInformation clientInformation) {
+         super(level, gameProfile);
+diff --git a/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java b/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
+index 48173bf5ef7217ed4d20ad53dae3d5445b633379..6562f6e60e810a16f48a8c9d101b37cf38855860 100644
+--- a/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
+@@ -90,6 +90,7 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+             this.prepareSpawnTask.close();
+             this.prepareSpawnTask = null;
+         }
++        net.minecraft.world.level.storage.PlayerDataStorage.clearPreloaded(this.gameProfile.id()); // Leaf - Async player.dat preloading
+ 
+         super.onDisconnect(details);
+     }
+diff --git a/net/minecraft/server/network/ServerLoginPacketListenerImpl.java b/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
+index 9418c1669ed96aab81acc79f02683729b705d130..93f0bcc93f0a9116c49b605785559e6e93c6b471 100644
+--- a/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
+@@ -62,6 +62,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+     public final Connection connection;
+     final ServerActivityMonitor serverActivityMonitor;
+     public volatile ServerLoginPacketListenerImpl.State state = ServerLoginPacketListenerImpl.State.HELLO;
++    private volatile boolean loginDisallowed = false; // Leaf - Async player.dat preloading
+     private int tick;
+     public @Nullable String requestedUsername; // Paper - public
+     public @Nullable GameProfile authenticatedProfile;
+@@ -127,6 +128,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+ 
+     // Paper start - Disconnect State Fixes
+     public void disconnectAsync(Component reason) {
++        this.loginDisallowed = true; // Leaf - Async player.dat preloading
+         try {
+             // Gale start - Pufferfish - do not log disconnections with null id
+             if (!org.galemc.gale.configuration.GaleGlobalConfiguration.get().logToConsole.nullIdDisconnections && this.authenticatedProfile != null && this.authenticatedProfile.id() == null) {
+@@ -146,6 +148,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+     }
+     // Paper end - Disconnect State Fixes
+     public void disconnect(Component reason) {
++        this.loginDisallowed = true; // Leaf - Async player.dat preloading
+         try {
+             // Gale start - Pufferfish - do not log disconnections with null id
+             if (!org.galemc.gale.configuration.GaleGlobalConfiguration.get().logToConsole.nullIdDisconnections && this.authenticatedProfile != null && this.authenticatedProfile.id() == null) {
+@@ -168,8 +171,19 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+         return this.server.getPlayerList().getPlayer(profile.id()) != null;
+     }
+ 
++    // Leaf start - Async player.dat preloading
++    private void preloadPlayerDataIfAllowed(GameProfile profile) {
++        if (!this.loginDisallowed && this.connection.isConnected() && profile.id() != null) {
++            this.server.playerDataStorage.preloadAsync(new NameAndId(profile));
++        }
++    }
++    // Leaf end - Async player.dat preloading
++
+     @Override
+     public void onDisconnect(DisconnectionDetails details) {
++        if (this.authenticatedProfile != null && this.authenticatedProfile.id() != null) {
++            net.minecraft.world.level.storage.PlayerDataStorage.clearPreloaded(this.authenticatedProfile.id()); // Leaf - Async player.dat preloading
++        }
+         LOGGER.info("{} lost connection: {}", this.getUserName(), details.reason().getString());
+     }
+ 
+@@ -236,6 +250,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+                         // Leaf end - Configurable vanilla username check
+ 
+                         gameprofile = ServerLoginPacketListenerImpl.this.callPlayerPreLoginEvents(gameprofile); // Paper - Add more fields to AsyncPlayerPreLoginEvent
++                        ServerLoginPacketListenerImpl.this.preloadPlayerDataIfAllowed(gameprofile); // Leaf - Async player.dat preloading
+                         ServerLoginPacketListenerImpl.LOGGER.info("UUID of player {} is {}", gameprofile.name(), gameprofile.id());
+                         ServerLoginPacketListenerImpl.this.startClientVerification(gameprofile);
+                     } catch (Exception ex) {
+@@ -258,6 +273,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+         PlayerList playerList = this.server.getPlayerList();
+         Component component = org.bukkit.craftbukkit.event.CraftEventFactory.handleLoginResult(playerList.canPlayerLogin(this.connection.getRemoteAddress(), new NameAndId(profile)), this.paperLoginConnection, this.connection, profile, this.server, true); // Paper
+         if (component != null) {
++            net.minecraft.world.level.storage.PlayerDataStorage.clearPreloaded(profile.id()); // Leaf - Async player.dat preloading
+             this.disconnectAsync(component); // Paper - Disconnect State Fixes
+         } else {
+             if (this.server.getCompressionThreshold() >= 0 && !this.connection.isMemoryConnection()) {
+@@ -321,6 +337,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+                         }
+                         gameProfile = ServerLoginPacketListenerImpl.this.callPlayerPreLoginEvents(gameProfile); // Paper - Add more fields to AsyncPlayerPreLoginEvent
+                         // CraftBukkit end
++                        ServerLoginPacketListenerImpl.this.preloadPlayerDataIfAllowed(gameProfile); // Leaf - Async player.dat preloading
+                         ServerLoginPacketListenerImpl.LOGGER.info("UUID of player {} is {}", gameProfile.name(), gameProfile.id());
+                         ServerLoginPacketListenerImpl.this.serverActivityMonitor.reportLoginActivity();
+                         ServerLoginPacketListenerImpl.this.startClientVerification(gameProfile);
+@@ -454,6 +471,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+             authenticatorPool.execute(() -> {
+                 try {
+                     final GameProfile gameprofile = this.callPlayerPreLoginEvents(this.authenticatedProfile);
++                    ServerLoginPacketListenerImpl.this.preloadPlayerDataIfAllowed(gameprofile); // Leaf - Async player.dat preloading
+                     ServerLoginPacketListenerImpl.LOGGER.info("UUID of player {} is {}", gameprofile.name(), gameprofile.id());
+                     ServerLoginPacketListenerImpl.this.startClientVerification(gameprofile);
+                 } catch (Exception ex) {
+diff --git a/net/minecraft/server/network/config/PrepareSpawnTask.java b/net/minecraft/server/network/config/PrepareSpawnTask.java
+index 5014840bf5d7ef53a4fea8aa6f3b25eb4033ff96..184f86d8e630dda499dfdc7a490e98042fe1a106 100644
+--- a/net/minecraft/server/network/config/PrepareSpawnTask.java
++++ b/net/minecraft/server/network/config/PrepareSpawnTask.java
+@@ -40,6 +40,7 @@ public class PrepareSpawnTask implements ConfigurationTask {
+     private final com.mojang.authlib.GameProfile profile;
+     private final net.minecraft.server.network.ServerConfigurationPacketListenerImpl listener;
+     private boolean newPlayer;
++    private @Nullable Optional<net.minecraft.nbt.CompoundTag> cachedPlayerData; // Leaf - Reuse preloaded player data between start() and spawn()
+     public PrepareSpawnTask(MinecraftServer server, com.mojang.authlib.GameProfile profile, net.minecraft.server.network.ServerConfigurationPacketListenerImpl listener) {
+         this.profile = profile;
+         this.listener = listener;
+@@ -52,9 +53,11 @@ public class PrepareSpawnTask implements ConfigurationTask {
+     @Override
+     public void start(Consumer<Packet<?>> task) {
+         try (ProblemReporter.ScopedCollector scopedCollector = new ProblemReporter.ScopedCollector(LOGGER)) {
+-            Optional<ValueInput> optional = this.server
++            Optional<net.minecraft.nbt.CompoundTag> rawPlayerData = this.server
+                 .getPlayerList()
+-                .loadPlayerData(this.nameAndId)
++                .loadPlayerData(this.nameAndId);
++            this.cachedPlayerData = rawPlayerData; // Leaf - Reuse preloaded player data between start() and spawn()
++            Optional<ValueInput> optional = rawPlayerData
+                 .map(compoundTag -> TagValueInput.create(scopedCollector, this.server.registryAccess(), compoundTag));
+             // Paper start - move logic in Entity to here, to use bukkit supplied world UUID & reset to main world spawn if no valid world is found
+             this.newPlayer = optional.isEmpty(); // New players don't have saved data!
+@@ -152,6 +155,8 @@ public class PrepareSpawnTask implements ConfigurationTask {
+             preparing.cancel();
+         }
+ 
++        this.cachedPlayerData = null; // Leaf - Cleanup preloaded data
++        net.minecraft.world.level.storage.PlayerDataStorage.clearPreloaded(this.nameAndId.id()); // Leaf - Cleanup preloaded data
+         this.state = null;
+     }
+ 
+@@ -280,9 +285,11 @@ public class PrepareSpawnTask implements ConfigurationTask {
+ 
+             ServerPlayer var7;
+             try (ProblemReporter.ScopedCollector scopedCollector = new ProblemReporter.ScopedCollector(serverPlayer.problemPath(), PrepareSpawnTask.LOGGER)) {
+-                Optional<ValueInput> optional = PrepareSpawnTask.this.server
+-                    .getPlayerList()
+-                    .loadPlayerData(PrepareSpawnTask.this.nameAndId)
++                Optional<net.minecraft.nbt.CompoundTag> rawData = PrepareSpawnTask.this.cachedPlayerData != null
++                    ? PrepareSpawnTask.this.cachedPlayerData
++                    : PrepareSpawnTask.this.server.getPlayerList().loadPlayerData(PrepareSpawnTask.this.nameAndId); // Leaf - Reuse preloaded player data
++                PrepareSpawnTask.this.cachedPlayerData = null; // Leaf - Release reference after spawn
++                Optional<ValueInput> optional = rawData
+                     // CraftBukkit start
+                     .map(tag -> {
+                         org.bukkit.craftbukkit.entity.CraftPlayer craftPlayer = serverPlayer.getBukkitEntity();
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index ccf2a7d2fbff4bfc9b6e4606059b4b2863071a08..8c60a491529ef1222bfb488480d25a7054ab5ca2 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -1445,6 +1445,9 @@ public abstract class PlayerList {
+     }
+     public ServerStatsCounter getPlayerStats(GameProfile gameProfile) {
+             Path path = this.locateStatsFile(gameProfile);
++            if (gameProfile.id() != null) {
++                org.dreeam.leaf.async.AsyncPlayerDataSaving.awaitPendingSave(gameProfile.id()); // Leaf - Async stats saving race protection
++            }
+             return new ServerStatsCounter(this.server, path);
+     }
+     // CraftBukkit end
+@@ -1480,6 +1483,7 @@ public abstract class PlayerList {
+         UUID uuid = player.getUUID();
+         PlayerAdvancements playerAdvancements = player.getAdvancements(); // CraftBukkit
+         if (playerAdvancements == null) {
++            org.dreeam.leaf.async.AsyncPlayerDataSaving.awaitPendingSave(uuid); // Leaf - Async advancements saving race protection
+             Path path = this.server.getWorldPath(LevelResource.PLAYER_ADVANCEMENTS_DIR).resolve(uuid + ".json");
+             playerAdvancements = new PlayerAdvancements(this.server.getFixerUpper(), this, this.server.getAdvancements(), path, player);
+             // this.advancements.put(uuid, playerAdvancements); // CraftBukkit
+diff --git a/net/minecraft/stats/ServerStatsCounter.java b/net/minecraft/stats/ServerStatsCounter.java
+index a697c066efd6b63ec5e14144ed050430197ae889..fff284a9c472ef12cd5ef25824a7a685be18f0a2 100644
+--- a/net/minecraft/stats/ServerStatsCounter.java
++++ b/net/minecraft/stats/ServerStatsCounter.java
+@@ -50,7 +50,103 @@ public class ServerStatsCounter extends StatsCounter {
+             return map1;
+         }, map -> map.entrySet().stream().collect(Collectors.groupingBy(entry -> entry.getKey().getType(), Util.toMap())));
+     private final Path file;
++    private final java.util.@org.jspecify.annotations.Nullable UUID playerUuid;
+     private final Set<Stat<?>> dirty = Sets.newHashSet();
++    // Leaf start - Async player stats preloading during login handshake
++    private record PreloadedStats(Path path, Map<Stat<?>, Integer> stats) {}
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, PreloadedStats> PRELOADED_STATS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, Long> PRELOADED_TIMESTAMPS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedStats>>> PRELOAD_FUTURES = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, java.util.concurrent.atomic.AtomicLong> SAVE_GENERATIONS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final long PRELOAD_TTL_MS = 120_000L;
++
++    public static void clearPreloaded(java.util.@org.jspecify.annotations.Nullable UUID uuid) {
++        if (uuid == null) {
++            return;
++        }
++        PRELOADED_STATS.remove(uuid);
++        PRELOADED_TIMESTAMPS.remove(uuid);
++        java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedStats>> future = PRELOAD_FUTURES.remove(uuid);
++        if (future != null) {
++            future.cancel(false);
++        }
++    }
++
++    public static void preloadAsync(MinecraftServer server, java.util.UUID uuid, java.util.concurrent.Executor executor) {
++        if (server.getPlayerList().getPlayer(uuid) != null) {
++            clearPreloaded(uuid);
++            return;
++        }
++        if (PRELOADED_STATS.size() > 256) {
++            long cutoff = System.currentTimeMillis() - PRELOAD_TTL_MS;
++            PRELOADED_TIMESTAMPS.forEach((k, ts) -> {
++                if (ts < cutoff) {
++                    clearPreloaded(k);
++                }
++            });
++        }
++
++        Path statsPath = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.PLAYER_STATS_DIR).resolve(uuid + ".json");
++        DataFixer fixerUpper = server.getFixerUpper();
++        long genAtStart = SAVE_GENERATIONS.computeIfAbsent(uuid, k -> new java.util.concurrent.atomic.AtomicLong()).get();
++        java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedStats>> future = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
++            org.dreeam.leaf.async.AsyncPlayerDataSaving.awaitPendingSave(uuid);
++            Map<Stat<?>, Integer> loaded = parseStatsFile(fixerUpper, statsPath);
++            java.util.concurrent.atomic.AtomicLong gen = SAVE_GENERATIONS.get(uuid);
++            if ((gen == null || gen.get() == genAtStart) && server.getPlayerList().getPlayer(uuid) == null) {
++                PreloadedStats entry = new PreloadedStats(statsPath, loaded);
++                PRELOADED_TIMESTAMPS.put(uuid, System.currentTimeMillis());
++                PRELOADED_STATS.put(uuid, entry);
++                return java.util.Optional.of(entry);
++            }
++            return java.util.Optional.empty();
++        }, executor);
++
++        java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedStats>> prev = PRELOAD_FUTURES.put(uuid, future);
++        if (prev != null && !prev.isDone()) {
++            prev.cancel(false);
++        }
++        future.whenComplete((res, ex) -> PRELOAD_FUTURES.remove(uuid, future));
++    }
++
++    private static Map<Stat<?>, Integer> parseStatsFile(DataFixer fixerUpper, Path file) {
++        if (Files.isRegularFile(file)) {
++            try (Reader bufferedReader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
++                JsonElement jsonElement = StrictJsonParser.parse(bufferedReader);
++                return parseStatsMap(fixerUpper, jsonElement, file);
++            } catch (IOException var8) {
++                LOGGER.error("Couldn't read statistics file {}", file, var8);
++            } catch (JsonParseException var9) {
++                LOGGER.error("Couldn't parse statistics file {}", file, var9);
++            }
++        }
++        return Map.of();
++    }
++
++    private static Map<Stat<?>, Integer> parseStatsMap(DataFixer fixerUpper, JsonElement json, @org.jspecify.annotations.Nullable Path file) {
++        Dynamic<JsonElement> dynamic = new Dynamic<>(JsonOps.INSTANCE, json);
++        dynamic = DataFixTypes.STATS.updateToCurrentVersion(fixerUpper, dynamic, NbtUtils.getDataVersion(dynamic, 1343));
++        return STATS_CODEC.parse(dynamic.get("stats").orElseEmptyMap())
++            .resultOrPartial(string -> {if (org.galemc.gale.configuration.GaleGlobalConfiguration.get().logToConsole.invalidStatistics) LOGGER.error("Failed to parse statistics for {}: {}", file, string);}) // Gale - EMC - do not log invalid statistics
++            .orElse(Map.of());
++    }
++    // Leaf end - Async player stats preloading during login handshake
++
++    private static java.util.@org.jspecify.annotations.Nullable UUID parseUuidFromFile(Path file) {
++        Path fileNamePath = file.getFileName();
++        if (fileNamePath == null) {
++            return null;
++        }
++        String name = fileNamePath.toString();
++        if (!name.endsWith(".json") || name.length() <= 5) {
++            return null;
++        }
++        try {
++            return java.util.UUID.fromString(name.substring(0, name.length() - 5));
++        } catch (IllegalArgumentException ignored) {
++            return null;
++        }
++    }
+ 
+     private static <T> Codec<Map<Stat<?>, Integer>> createTypedStatsCodec(StatType<T> type) {
+         Codec<T> codec = type.getRegistry().byNameCodec();
+@@ -65,16 +161,39 @@ public class ServerStatsCounter extends StatsCounter {
+ 
+     public ServerStatsCounter(MinecraftServer server, Path file) {
+         this.file = file;
+-        if (Files.isRegularFile(file)) {
+-            try (Reader bufferedReader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+-                JsonElement jsonElement = StrictJsonParser.parse(bufferedReader);
+-                this.parse(server.getFixerUpper(), jsonElement);
+-            } catch (IOException var8) {
+-                LOGGER.error("Couldn't read statistics file {}", file, var8);
+-            } catch (JsonParseException var9) {
+-                LOGGER.error("Couldn't parse statistics file {}", file, var9);
++        this.playerUuid = parseUuidFromFile(file);
++        // Leaf start - Consume asynchronously preloaded stats if valid
++        Map<Stat<?>, Integer> preloadedStats = null;
++        if (this.playerUuid != null) {
++            PreloadedStats preloaded = PRELOADED_STATS.remove(this.playerUuid);
++            Long loadedAt = PRELOADED_TIMESTAMPS.remove(this.playerUuid);
++            if (preloaded != null) {
++                PRELOAD_FUTURES.remove(this.playerUuid);
++                if (preloaded.path().equals(file) && (loadedAt == null || (System.currentTimeMillis() - loadedAt) <= PRELOAD_TTL_MS)) {
++                    preloadedStats = preloaded.stats();
++                }
++            } else {
++                java.util.concurrent.CompletableFuture<java.util.Optional<PreloadedStats>> inFlight = PRELOAD_FUTURES.remove(this.playerUuid);
++                if (inFlight != null && !inFlight.isCancelled()) {
++                    try {
++                        PreloadedStats entry = inFlight.get().orElse(null);
++                        PRELOADED_STATS.remove(this.playerUuid);
++                        PRELOADED_TIMESTAMPS.remove(this.playerUuid);
++                        if (entry != null && entry.path().equals(file)) {
++                            preloadedStats = entry.stats();
++                        }
++                    } catch (Exception ignored) {
++                    }
++                }
+             }
+         }
++        if (preloadedStats == null) {
++            preloadedStats = parseStatsFile(server.getFixerUpper(), file);
++        }
++        if (!preloadedStats.isEmpty()) {
++            this.stats.putAll(preloadedStats);
++        }
++        // Leaf end - Consume asynchronously preloaded stats if valid
+         // Paper start - Moved after stat fetching for player state file
+         // Moves the loading after vanilla loading, so it overrides the values.
+         // Disables saving any forced stats, so it stays at the same value (without enabling disableStatSaving)
+@@ -91,15 +210,24 @@ public class ServerStatsCounter extends StatsCounter {
+     public void save() {
+         if (org.spigotmc.SpigotConfig.disableStatSaving) return; // Spigot
+         if (org.dreeam.leaf.config.modules.misc.RegionFormatConfig.isReadOnlyMode()) return; // Leaf - Add read-only mode for Linear v2
+-        try {
+-            FileUtil.createDirectoriesSafe(this.file.getParent());
++        if (this.playerUuid != null) {
++            SAVE_GENERATIONS.computeIfAbsent(this.playerUuid, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
++            clearPreloaded(this.playerUuid);
++        }
++        final JsonElement json = this.toJson();
++        final Path saveFile = this.file;
++
++        org.dreeam.leaf.async.AsyncPlayerDataSaving.submitPlayerSave(this.playerUuid, () -> {
++            try {
++                FileUtil.createDirectoriesSafe(saveFile.getParent());
+ 
+-            try (Writer bufferedWriter = Files.newBufferedWriter(this.file, StandardCharsets.UTF_8)) {
+-                GSON.toJson(this.toJson(), GSON.newJsonWriter(bufferedWriter));
++                try (Writer bufferedWriter = Files.newBufferedWriter(saveFile, StandardCharsets.UTF_8)) {
++                    GSON.toJson(json, GSON.newJsonWriter(bufferedWriter));
++                }
++            } catch (JsonIOException | IOException var6) {
++                LOGGER.error("Couldn't save stats to {}", saveFile, var6);
+             }
+-        } catch (JsonIOException | IOException var6) {
+-            LOGGER.error("Couldn't save stats to {}", this.file, var6);
+-        }
++        });
+     }
+ 
+     @Override
+@@ -122,14 +250,7 @@ public class ServerStatsCounter extends StatsCounter {
+     // SparklyPaper end
+ 
+     public void parse(DataFixer fixerUpper, JsonElement json) {
+-        Dynamic<JsonElement> dynamic = new Dynamic<>(JsonOps.INSTANCE, json);
+-        dynamic = DataFixTypes.STATS.updateToCurrentVersion(fixerUpper, dynamic, NbtUtils.getDataVersion(dynamic, 1343));
+-        this.stats
+-            .putAll(
+-                STATS_CODEC.parse(dynamic.get("stats").orElseEmptyMap())
+-                    .resultOrPartial(string -> {if (org.galemc.gale.configuration.GaleGlobalConfiguration.get().logToConsole.invalidStatistics) LOGGER.error("Failed to parse statistics for {}: {}", this.file, string);}) // Gale - EMC - do not log invalid statistics
+-                    .orElse(Map.of())
+-            );
++        this.stats.putAll(parseStatsMap(fixerUpper, json, this.file));
+     }
+ 
+     protected JsonElement toJson() {
+diff --git a/net/minecraft/world/ContainerHelper.java b/net/minecraft/world/ContainerHelper.java
+index 88c08c9f632c2f045106d8ac76d7d96b99206fbf..8dda84f0e80dc486ec090215f47782309cc96c6c 100644
+--- a/net/minecraft/world/ContainerHelper.java
++++ b/net/minecraft/world/ContainerHelper.java
+@@ -45,6 +45,37 @@ public class ContainerHelper {
+         }
+     }
+ 
++    // Leaf start - Defer container item decoding
++    public static @org.jspecify.annotations.Nullable PendingItems loadAllItemsDeferred(final ValueInput input, final NonNullList<ItemStack> itemStacks) {
++        if (org.dreeam.leaf.config.modules.opt.ContainerItemLazyLoading.lazyContainerItemLoading
++            && input instanceof net.minecraft.world.level.storage.TagValueInput tagInput
++            && tagInput.hasNonEmptyList("Items")) {
++            return new PendingItems(tagInput);
++        }
++        loadAllItems(input, itemStacks);
++        return null;
++    }
++
++    public static final class PendingItems {
++        private static final org.slf4j.Logger LOGGER = com.mojang.logging.LogUtils.getLogger();
++        private final net.minecraft.world.level.storage.TagValueInput input;
++
++        private PendingItems(final net.minecraft.world.level.storage.TagValueInput input) {
++            this.input = input.retainField("Items");
++        }
++
++        public void load(final NonNullList<ItemStack> itemStacks, final net.minecraft.util.ProblemReporter.PathElement path) {
++            try (net.minecraft.util.ProblemReporter.ScopedCollector reporter = new net.minecraft.util.ProblemReporter.ScopedCollector(path, LOGGER)) {
++                loadAllItems(this.input.withProblemReporter(reporter), itemStacks);
++            }
++        }
++
++        public void save(final ValueOutput output) {
++            this.input.copyFieldTo("Items", output);
++        }
++    }
++    // Leaf end - Defer container item decoding
++
+     public static int clearOrCountMatchingItems(Container container, Predicate<ItemStack> itemPredicate, int maxItems, boolean simulate) {
+         int i = 0;
+ 
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 621006ced1b053c44ecc2187e03635bc188c58c3..6ef8d3f41049f6c7399a66cfdccaec8abf4a1e9a 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -367,7 +367,7 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     // Marks an entity, that it was removed by a plugin via Entity#remove
+     // Main use case currently is for SPIGOT-7487, preventing dropping of leash when leash is removed
+     public boolean pluginRemoved = false;
+-    protected int numCollisions = 0; // Paper - Cap entity collisions
++    public int numCollisions = 0; // Paper - Cap entity collisions // Leaf - public access for parallel collision dispatcher
+     public boolean fromNetherPortal; // Paper - Add option to nerf pigmen from nether portals
+     public boolean spawnedViaMobSpawner; // Paper - Yes this name is similar to above, upstream took the better one
+     // Paper start
+diff --git a/net/minecraft/world/entity/LivingEntity.java b/net/minecraft/world/entity/LivingEntity.java
+index 3b83547dcfa6286b4e03b41583429a50a0a3744e..bfb4a7a888f0f24da776d1ad507f21b90b372d86 100644
+--- a/net/minecraft/world/entity/LivingEntity.java
++++ b/net/minecraft/world/entity/LivingEntity.java
+@@ -156,6 +156,7 @@ import org.bukkit.event.entity.EntityResurrectEvent;
+ 
+ public abstract class LivingEntity extends Entity implements Attackable, WaypointTransmitter, net.caffeinemc.mods.lithium.common.world.in_world_tracking.MaybeInLevelObject { // Leaf - Lithium - equipment tracking
+     private static final Logger LOGGER = LogUtils.getLogger();
++    public transient boolean parallelCollisionHandled = false; // Leaf - Parallel collisions
+     private static final String TAG_ACTIVE_EFFECTS = "active_effects";
+     public static final String TAG_ATTRIBUTES = "attributes";
+     public static final String TAG_SLEEPING_POS = "sleeping_pos";
+@@ -4090,6 +4091,12 @@ public abstract class LivingEntity extends Entity implements Attackable, Waypoin
+     }
+ 
+     protected void pushEntities() {
++        // Leaf start - Parallel collisions
++        if (this.parallelCollisionHandled) {
++            this.parallelCollisionHandled = false;
++            return;
++        }
++        // Leaf end - Parallel collisions
+         // Paper start - don't run getEntities if we're not going to use its result
+         if (!this.isPushable()) {
+             return;
+diff --git a/net/minecraft/world/entity/ai/Brain.java b/net/minecraft/world/entity/ai/Brain.java
+index 1cca7dab4cfb503d2f6e4bb80ac0e318fcd9aace..e568f27b29c84ff9d55b2c48c44517a5ed3ae425 100644
+--- a/net/minecraft/world/entity/ai/Brain.java
++++ b/net/minecraft/world/entity/ai/Brain.java
+@@ -64,6 +64,11 @@ public class Brain<E extends LivingEntity> {
+     // Leaf end - Replace brain maps with optimized collection
+     private Activity defaultActivity = Activity.IDLE;
+     private long lastScheduleUpdate = -9999L;
++    // Leaf start - Parallel sensing support
++    public volatile boolean isStagingMemories = false;
++    public transient boolean sensingHandledThisTick = false;
++    private final java.util.Queue<java.util.Map.Entry<MemoryModuleType<?>, Optional<? extends ExpirableValue<?>>>> stagedMemories = new java.util.concurrent.ConcurrentLinkedQueue<>();
++    // Leaf end - Parallel sensing support
+ 
+     public static <E extends LivingEntity> Brain.Provider<E> provider(
+         Collection<? extends MemoryModuleType<?>> memoryTypes, Collection<? extends SensorType<? extends Sensor<? super E>>> sensorTypes
+@@ -210,6 +215,12 @@ public class Brain<E extends LivingEntity> {
+     }
+ 
+     <U> void setMemoryInternal(MemoryModuleType<U> memoryType, Optional<? extends ExpirableValue<?>> memory) {
++        // Leaf start - Parallel sensing support
++        if (this.isStagingMemories) {
++            this.stagedMemories.add(java.util.Map.entry(memoryType, memory));
++            return;
++        }
++        // Leaf end - Parallel sensing support
+         if (this.memories.containsKey(memoryType)) {
+             if (memory.isPresent() && this.isEmptyCollection(memory.get().getValue())) {
+                 this.eraseMemory(memoryType);
+@@ -436,11 +447,50 @@ public class Brain<E extends LivingEntity> {
+ 
+     public void tick(ServerLevel level, E entity) {
+         this.forgetOutdatedMemories();
+-        this.tickSensors(level, entity);
++        // Leaf start - Parallel sensing support
++        if (!this.sensingHandledThisTick) {
++            this.tickSensors(level, entity);
++        } else {
++            this.sensingHandledThisTick = false;
++            this.tickMainThreadOnlySensors(level, entity);
++        }
++        // Leaf end - Parallel sensing support
+         this.startEachNonRunningBehavior(level, entity);
+         this.tickEachRunningBehavior(level, entity);
+     }
+ 
++    // Leaf start - Parallel sensing support
++    private void tickMainThreadOnlySensors(ServerLevel level, E brainHolder) {
++        for (Sensor<? super E> sensor : this.sensors.values()) {
++            if (!sensor.canTickAsync()) {
++                sensor.tick(level, brainHolder);
++            }
++        }
++    }
++
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    public void commitStagedMemories() {
++        java.util.Map.Entry<MemoryModuleType<?>, Optional<? extends ExpirableValue<?>>> entry;
++        while ((entry = this.stagedMemories.poll()) != null) {
++            this.setMemoryInternal((MemoryModuleType) entry.getKey(), entry.getValue());
++        }
++        this.isStagingMemories = false;
++        this.sensingHandledThisTick = true;
++    }
++
++    public void tickSensorsExternal(ServerLevel level, E brainHolder) {
++        for (Sensor<? super E> sensor : this.sensors.values()) {
++            if (sensor.canTickAsync()) {
++                sensor.tick(level, brainHolder);
++            }
++        }
++    }
++
++    public boolean hasSensors() {
++        return !this.sensors.isEmpty();
++    }
++    // Leaf end - Parallel sensing support
++
+     private void tickSensors(ServerLevel level, E brainHolder) {
+         for (Sensor<? super E> sensor : this.sensors.values()) {
+             sensor.tick(level, brainHolder);
+diff --git a/net/minecraft/world/entity/ai/behavior/AcquirePoi.java b/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
+index 7b6fcd414aa4b29b23825ed0c23a8545eef2c514..d47ebd0c8a0f7d06c4c61858d1bf5bc19e861019 100644
+--- a/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
++++ b/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
+@@ -86,10 +86,14 @@ public class AcquirePoi {
+                                 return false;
+                             }
+                         }
+-                        if (pending != null && stateSet != null && pending.isProcessed()) {
++                        if (pending != null && stateSet != null) {
++                            if (!pending.isProcessed()) {
++                                return false; // Leaf - non-blocking wait for async path
++                            }
+                             processPath(acquirablePois, entityEventId, map, level, mob, acquiringMemory, time, level.getPoiManager(), stateSet, pending);
+                             pending = null;
+                             stateSet = null;
++                            return true;
+                         }
+ 
+                         if (onlyIfAdult && mob.isBaby()) {
+diff --git a/net/minecraft/world/entity/ai/behavior/InteractWithDoor.java b/net/minecraft/world/entity/ai/behavior/InteractWithDoor.java
+index 5c845d78e8baee41809e0678e3d99523368a2882..9429e2d51aa1d6ffebb6ef4bb9b5604e7f5461de 100644
+--- a/net/minecraft/world/entity/ai/behavior/InteractWithDoor.java
++++ b/net/minecraft/world/entity/ai/behavior/InteractWithDoor.java
+@@ -43,7 +43,7 @@ public class InteractWithDoor {
+                     (navigationPath, doorsToClose, nearestLivingEntities) -> (level, entity, gameTime) -> {
+                         Path path = instance.get(navigationPath);
+                         Optional<Set<GlobalPos>> optional = instance.tryGet(doorsToClose);
+-                        if (!path.notStarted() && !path.isDone()) {
++                        if (path.isProcessed() && !path.notStarted() && !path.isDone()) {
+                             if (Objects.equals(mutableObject.get(), path.getNextNode())) {
+                                 mutableInt.setValue(20);
+                             } else if (mutableInt.decrementAndGet() > 0) {
+@@ -150,7 +150,7 @@ public class InteractWithDoor {
+             return false;
+         } else {
+             Path path = brain.getMemory(MemoryModuleType.PATH).get();
+-            if (path.isDone()) {
++            if (!path.isProcessed() || path.isDone()) {
+                 return false;
+             } else {
+                 Node previousNode = path.getPreviousNode();
+diff --git a/net/minecraft/world/entity/ai/behavior/MoveToTargetSink.java b/net/minecraft/world/entity/ai/behavior/MoveToTargetSink.java
+index 55a2d8b66b076bc50adc425457a64d8540ce2d78..5ceb3a31542f083712b139577ca5bf1e1fefdfe8 100644
+--- a/net/minecraft/world/entity/ai/behavior/MoveToTargetSink.java
++++ b/net/minecraft/world/entity/ai/behavior/MoveToTargetSink.java
+@@ -149,6 +149,12 @@ public class MoveToTargetSink extends Behavior<Mob> {
+ 
+             Path path = owner.getNavigation().getPath();
+             Brain<?> brain = owner.getBrain();
++            if (this.path != path) {
++                this.path = path;
++                if (path != null && path.isProcessed()) {
++                    brain.setMemory(MemoryModuleType.PATH, path);
++                }
++            }
+ 
+             if (path != null && this.lastTargetPos != null && brain.hasMemoryValue(MemoryModuleType.WALK_TARGET)) {
+                 WalkTarget walkTarget = brain.getMemory(MemoryModuleType.WALK_TARGET).get(); // we know isPresent = true
+diff --git a/net/minecraft/world/entity/ai/navigation/PathNavigation.java b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+index 0663cb18c289f16ea76a9c1790ef4e46e5ef4de7..45c2908350418e9d69e35dd843a86507ccda2368 100644
+--- a/net/minecraft/world/entity/ai/navigation/PathNavigation.java
++++ b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+@@ -39,6 +39,7 @@ public abstract class PathNavigation {
+     protected @Nullable Path path;
+     protected double speedModifier;
+     protected int tick;
++    private boolean leaf$pathPrepared = false; // Leaf - track async path preparation
+     protected int lastStuckCheck;
+     protected Vec3 lastStuckCheckPos = Vec3.ZERO;
+     protected Vec3i timeoutCachedNode = Vec3i.ZERO;
+@@ -260,6 +261,7 @@ public abstract class PathNavigation {
+         } else {
+             if (!path.sameAs(this.path)) {
+                 this.path = path;
++                this.leaf$pathPrepared = false;
+             }
+ 
+             if (this.isDone()) {
+@@ -288,7 +290,16 @@ public abstract class PathNavigation {
+         if (this.hasDelayedRecomputation) {
+             this.recomputePath();
+         }
+-        if (this.path != null && !this.path.isProcessed()) return; // Kaiiju - petal - async path processing - skip pathfinding if we're still processing
++        if (this.path != null) {
++            if (!this.path.isProcessed()) return; // Kaiiju - petal - async path processing - skip pathfinding if we're still processing
++            if (!this.leaf$pathPrepared) {
++                this.leaf$pathPrepared = true;
++                this.trimPath();
++                if (this.mob.getBrain().hasMemoryValue(net.minecraft.world.entity.ai.memory.MemoryModuleType.PATH)) {
++                    this.mob.getBrain().setMemory(net.minecraft.world.entity.ai.memory.MemoryModuleType.PATH, this.path);
++                }
++            }
++        }
+ 
+         if (!this.isDone()) {
+             if (this.canUpdatePath()) {
+diff --git a/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java b/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java
+index 04f9b82d2ba74dbbddb75c196db177636ea762f9..c5e4703b0bd08d80a90bb2b3542ababe4fb8e866 100644
+--- a/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java
++++ b/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java
+@@ -32,6 +32,13 @@ public class NearestBedSensor extends Sensor<Mob> {
+         super(20);
+     }
+ 
++    // Leaf start - Synchronous sensor only (calls PoiManager / PathNavigation)
++    @Override
++    public boolean canTickAsync() {
++        return false;
++    }
++    // Leaf end - Synchronous sensor only
++
+     @Override
+     public Set<MemoryModuleType<?>> requires() {
+         return ImmutableSet.of(MemoryModuleType.NEAREST_BED);
+diff --git a/net/minecraft/world/entity/ai/sensing/SecondaryPoiSensor.java b/net/minecraft/world/entity/ai/sensing/SecondaryPoiSensor.java
+index f031e9d290ee48db90d557828f2079517ce8b4f5..36017fcab3ffc63cb57dfe977400fd0cb53fb38a 100644
+--- a/net/minecraft/world/entity/ai/sensing/SecondaryPoiSensor.java
++++ b/net/minecraft/world/entity/ai/sensing/SecondaryPoiSensor.java
+@@ -41,7 +41,8 @@ public class SecondaryPoiSensor extends Sensor<Villager> {
+             for (int i2 = -2; i2 <= 2; i2++) {
+                 for (int i3 = -4; i3 <= 4; i3++) {
+                     BlockPos blockPos1 = blockPos.offset(i1, i2, i3);
+-                    if (secondaryPoi.contains(level.getBlockState(blockPos1).getBlock())) { // Gale - Lithium - skip secondary POI sensor if absent
++                    net.minecraft.world.level.block.state.BlockState blockState = level.getBlockStateIfLoaded(blockPos1); // Leaf - avoid sync chunk load off-main in parallel sensing
++                    if (blockState != null && secondaryPoi.contains(blockState.getBlock())) { // Gale - Lithium - skip secondary POI sensor if absent
+                         list.add(GlobalPos.of(resourceKey, blockPos1));
+                     }
+                 }
+diff --git a/net/minecraft/world/entity/ai/sensing/Sensor.java b/net/minecraft/world/entity/ai/sensing/Sensor.java
+index 1441f24413b10538e6bdc0f894234d96916c57dc..2f7205fe3883727249fffc513a56d7f7cbbca191 100644
+--- a/net/minecraft/world/entity/ai/sensing/Sensor.java
++++ b/net/minecraft/world/entity/ai/sensing/Sensor.java
+@@ -14,19 +14,28 @@ public abstract class Sensor<E extends LivingEntity> {
+     private static final RandomSource RANDOM = RandomSource.createThreadSafe();
+     private static final int DEFAULT_SCAN_RATE = 20;
+     private static final int DEFAULT_TARGETING_RANGE = 16;
+-    private static final TargetingConditions TARGET_CONDITIONS = TargetingConditions.forNonCombat().range(16.0);
+-    private static final TargetingConditions TARGET_CONDITIONS_IGNORE_INVISIBILITY_TESTING = TargetingConditions.forNonCombat()
+-        .range(16.0)
+-        .ignoreInvisibilityTesting();
+-    private static final TargetingConditions ATTACK_TARGET_CONDITIONS = TargetingConditions.forCombat().range(16.0);
+-    private static final TargetingConditions ATTACK_TARGET_CONDITIONS_IGNORE_INVISIBILITY_TESTING = TargetingConditions.forCombat()
+-        .range(16.0)
+-        .ignoreInvisibilityTesting();
+-    private static final TargetingConditions ATTACK_TARGET_CONDITIONS_IGNORE_LINE_OF_SIGHT = TargetingConditions.forCombat().range(16.0).ignoreLineOfSight();
+-    private static final TargetingConditions ATTACK_TARGET_CONDITIONS_IGNORE_INVISIBILITY_AND_LINE_OF_SIGHT = TargetingConditions.forCombat()
+-        .range(16.0)
+-        .ignoreLineOfSight()
+-        .ignoreInvisibilityTesting();
++    // Leaf start - ThreadLocal targeting conditions to prevent data races during parallel sensing
++    private record TargetingConditionsHolder(
++        TargetingConditions targetConditions,
++        TargetingConditions targetConditionsIgnoreInvisibility,
++        TargetingConditions attackTargetConditions,
++        TargetingConditions attackTargetConditionsIgnoreInvisibility,
++        TargetingConditions attackTargetConditionsIgnoreLineOfSight,
++        TargetingConditions attackTargetConditionsIgnoreInvisibilityAndLineOfSight
++    ) {
++        TargetingConditionsHolder() {
++            this(
++                TargetingConditions.forNonCombat().range(16.0),
++                TargetingConditions.forNonCombat().range(16.0).ignoreInvisibilityTesting(),
++                TargetingConditions.forCombat().range(16.0),
++                TargetingConditions.forCombat().range(16.0).ignoreInvisibilityTesting(),
++                TargetingConditions.forCombat().range(16.0).ignoreLineOfSight(),
++                TargetingConditions.forCombat().range(16.0).ignoreLineOfSight().ignoreInvisibilityTesting()
++            );
++        }
++    }
++    private static final ThreadLocal<TargetingConditionsHolder> CONDITIONS = ThreadLocal.withInitial(TargetingConditionsHolder::new);
++    // Leaf end - ThreadLocal targeting conditions
+     private final int scanRate;
+     private long timeToTick;
+     private final String configKey; // Paper - configurable sensor tick rate and timings
+@@ -58,28 +67,43 @@ public abstract class Sensor<E extends LivingEntity> {
+ 
+     private void updateTargetingConditionRanges(E entity) {
+         double attributeValue = entity.getAttributeValue(Attributes.FOLLOW_RANGE);
+-        TARGET_CONDITIONS.range(attributeValue);
+-        TARGET_CONDITIONS_IGNORE_INVISIBILITY_TESTING.range(attributeValue);
+-        ATTACK_TARGET_CONDITIONS.range(attributeValue);
+-        ATTACK_TARGET_CONDITIONS_IGNORE_INVISIBILITY_TESTING.range(attributeValue);
+-        ATTACK_TARGET_CONDITIONS_IGNORE_LINE_OF_SIGHT.range(attributeValue);
+-        ATTACK_TARGET_CONDITIONS_IGNORE_INVISIBILITY_AND_LINE_OF_SIGHT.range(attributeValue);
++        // Leaf start - ThreadLocal targeting conditions
++        TargetingConditionsHolder holder = CONDITIONS.get();
++        holder.targetConditions.range(attributeValue);
++        holder.targetConditionsIgnoreInvisibility.range(attributeValue);
++        holder.attackTargetConditions.range(attributeValue);
++        holder.attackTargetConditionsIgnoreInvisibility.range(attributeValue);
++        holder.attackTargetConditionsIgnoreLineOfSight.range(attributeValue);
++        holder.attackTargetConditionsIgnoreInvisibilityAndLineOfSight.range(attributeValue);
++        // Leaf end - ThreadLocal targeting conditions
+     }
+ 
+     protected abstract void doTick(ServerLevel level, E entity);
+ 
++    // Leaf start - Parallel sensing support
++    public boolean canTickAsync() {
++        return true;
++    }
++    // Leaf end - Parallel sensing support
++
+     public abstract Set<MemoryModuleType<?>> requires();
+ 
+     public static boolean isEntityTargetable(ServerLevel level, LivingEntity entity, LivingEntity target) {
++        // Leaf start - ThreadLocal targeting conditions
++        TargetingConditionsHolder holder = CONDITIONS.get();
+         return entity.getBrain().isMemoryValue(MemoryModuleType.ATTACK_TARGET, target)
+-            ? TARGET_CONDITIONS_IGNORE_INVISIBILITY_TESTING.test(level, entity, target)
+-            : TARGET_CONDITIONS.test(level, entity, target);
++            ? holder.targetConditionsIgnoreInvisibility.test(level, entity, target)
++            : holder.targetConditions.test(level, entity, target);
++        // Leaf end - ThreadLocal targeting conditions
+     }
+ 
+     public static boolean isEntityAttackable(ServerLevel level, LivingEntity entity, LivingEntity target) {
++        // Leaf start - ThreadLocal targeting conditions
++        TargetingConditionsHolder holder = CONDITIONS.get();
+         return entity.getBrain().isMemoryValue(MemoryModuleType.ATTACK_TARGET, target)
+-            ? ATTACK_TARGET_CONDITIONS_IGNORE_INVISIBILITY_TESTING.test(level, entity, target)
+-            : ATTACK_TARGET_CONDITIONS.test(level, entity, target);
++            ? holder.attackTargetConditionsIgnoreInvisibility.test(level, entity, target)
++            : holder.attackTargetConditions.test(level, entity, target);
++        // Leaf end - ThreadLocal targeting conditions
+     }
+ 
+     public static BiPredicate<ServerLevel, LivingEntity> wasEntityAttackableLastNTicks(LivingEntity entity, int ticks) {
+@@ -87,9 +111,12 @@ public abstract class Sensor<E extends LivingEntity> {
+     }
+ 
+     public static boolean isEntityAttackableIgnoringLineOfSight(ServerLevel level, LivingEntity entity, LivingEntity target) {
++        // Leaf start - ThreadLocal targeting conditions
++        TargetingConditionsHolder holder = CONDITIONS.get();
+         return entity.getBrain().isMemoryValue(MemoryModuleType.ATTACK_TARGET, target)
+-            ? ATTACK_TARGET_CONDITIONS_IGNORE_INVISIBILITY_AND_LINE_OF_SIGHT.test(level, entity, target)
+-            : ATTACK_TARGET_CONDITIONS_IGNORE_LINE_OF_SIGHT.test(level, entity, target);
++            ? holder.attackTargetConditionsIgnoreInvisibilityAndLineOfSight.test(level, entity, target)
++            : holder.attackTargetConditionsIgnoreLineOfSight.test(level, entity, target);
++        // Leaf end - ThreadLocal targeting conditions
+     }
+ 
+     static <T, U> BiPredicate<T, U> rememberPositives(int ticks, BiPredicate<T, U> predicate) {
+diff --git a/net/minecraft/world/entity/ai/sensing/TemptingSensor.java b/net/minecraft/world/entity/ai/sensing/TemptingSensor.java
+index 1bf9d8bc7addb152c4ca025cf86f8229f3fec5ed..5200fd2f2c940dc48a1ba76f66cea3f50812ef93 100644
+--- a/net/minecraft/world/entity/ai/sensing/TemptingSensor.java
++++ b/net/minecraft/world/entity/ai/sensing/TemptingSensor.java
+@@ -37,6 +37,13 @@ public class TemptingSensor extends Sensor<PathfinderMob> {
+         this.globalTemptationLookupIndex = -1;
+     }
+ 
++    // Leaf start - Synchronous sensor only (mutates GlobalTemptationLookup)
++    @Override
++    public boolean canTickAsync() {
++        return false;
++    }
++    // Leaf end - Synchronous sensor only
++
+     @Override
+     protected void doTick(ServerLevel level, PathfinderMob entity) {
+         Brain<?> brain = entity.getBrain();
+diff --git a/net/minecraft/world/entity/ai/village/poi/PoiManager.java b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+index cb4329d42a7e260a8bdaae2bc9b3b6003424089b..e94dcdbb336e86887428376518ba8d8bf32969b9 100644
+--- a/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -411,15 +411,22 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+     }
+ 
+     private void updateFromSection(LevelChunkSection section, SectionPos sectionPos, BiConsumer<BlockPos, Holder<PoiType>> posToTypeConsumer) {
+-        sectionPos.blocksInside()
+-            .forEach(
+-                blockPos -> {
+-                    BlockState blockState = section.getBlockState(
+-                        SectionPos.sectionRelative(blockPos.getX()), SectionPos.sectionRelative(blockPos.getY()), SectionPos.sectionRelative(blockPos.getZ())
+-                    );
+-                    PoiTypes.forState(blockState).ifPresent(holder -> posToTypeConsumer.accept(blockPos, (Holder<PoiType>)holder));
++        // Leaf start - Remove Stream and Optional allocation in PoiManager#updateFromSection
++        final int baseX = sectionPos.minBlockX();
++        final int baseY = sectionPos.minBlockY();
++        final int baseZ = sectionPos.minBlockZ();
++        for (int y = 0; y < 16; y++) {
++            for (int z = 0; z < 16; z++) {
++                for (int x = 0; x < 16; x++) {
++                    BlockState blockState = section.getBlockState(x, y, z);
++                    Holder<PoiType> poiType = blockState.leaf$poiType;
++                    if (poiType != null) {
++                        posToTypeConsumer.accept(new BlockPos(baseX + x, baseY + y, baseZ + z), poiType);
++                    }
+                 }
+-            );
++            }
++        }
++        // Leaf end - Remove Stream and Optional allocation in PoiManager#updateFromSection
+     }
+ 
+     public void ensureLoadedAndValid(LevelReader level, BlockPos pos, int radius) {
+diff --git a/net/minecraft/world/entity/ai/village/poi/PoiTypes.java b/net/minecraft/world/entity/ai/village/poi/PoiTypes.java
+index df666bdabc6dc8d07691e5859a582f90d929891f..e338b64b5b223a787a493e6dcc8c4f9e6050bd38 100644
+--- a/net/minecraft/world/entity/ai/village/poi/PoiTypes.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiTypes.java
+@@ -98,6 +98,7 @@ public class PoiTypes {
+     }
+ 
+     private static void registerBlockStates(Holder<PoiType> poi, Set<BlockState> states) {
++        Optional<Holder<PoiType>> cachedOptional = Optional.of(poi);
+         states.forEach(
+             state -> {
+                 Holder<PoiType> holder = TYPE_BY_STATE.put(state, poi);
+@@ -106,16 +107,18 @@ public class PoiTypes {
+                         new IllegalStateException(String.format(Locale.ROOT, "%s is defined in more than one PoI type", state))
+                     );
+                 }
++                state.leaf$poiType = poi;
++                state.leaf$poiTypeOptional = cachedOptional;
+             }
+         );
+     }
+ 
+     public static Optional<Holder<PoiType>> forState(BlockState state) {
+-        return Optional.ofNullable(TYPE_BY_STATE.get(state));
++        return state.leaf$poiTypeOptional;
+     }
+ 
+     public static boolean hasPoi(BlockState state) {
+-        return TYPE_BY_STATE.containsKey(state);
++        return state.leaf$poiType != null;
+     }
+ 
+     public static PoiType bootstrap(Registry<PoiType> registry) {
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 82ea05f127539853da9b0b12d477be1ac03017aa..f1c4c418c44192145ac7acb2a19bd4a2caba4762 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -1770,7 +1770,7 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     @Override
+     public List<Entity> getEntities(@Nullable Entity entity, AABB boundingBox, Predicate<? super Entity> predicate) {
+-        if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread((ServerLevel)this, boundingBox, "Cannot getEntities asynchronously"); // Leaf - SparklyPaper - parallel world ticking (additional concurrency issues logs)
++        if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled && !(this instanceof ServerLevel sl && sl.isParallelReadPassActive)) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread((ServerLevel)this, boundingBox, "Cannot getEntities asynchronously"); // Leaf - SparklyPaper - parallel world ticking (additional concurrency issues logs)
+         Profiler.get().incrementCounter("getEntities");
+         List<Entity> list = Lists.newArrayList();
+ 
+diff --git a/net/minecraft/world/level/block/entity/BarrelBlockEntity.java b/net/minecraft/world/level/block/entity/BarrelBlockEntity.java
+index f8cb1e67934a6c4abf5f4bc57d3f24928acab1eb..c6abcf135a64854a3de5d84f546e3ef6d4990f57 100644
+--- a/net/minecraft/world/level/block/entity/BarrelBlockEntity.java
++++ b/net/minecraft/world/level/block/entity/BarrelBlockEntity.java
+@@ -30,7 +30,7 @@ public class BarrelBlockEntity extends RandomizableContainerBlockEntity implemen
+ 
+     @Override
+     public java.util.List<ItemStack> getContents() {
+-        return this.items;
++        return this.getItems(); // Leaf - Defer container item decoding
+     }
+ 
+     @Override
+@@ -69,6 +69,7 @@ public class BarrelBlockEntity extends RandomizableContainerBlockEntity implemen
+         default -> 27;
+     }, ItemStack.EMPTY);
+     // Purpur end - Barrels and enderchests 6 rows
++    private ContainerHelper.@org.jspecify.annotations.Nullable PendingItems pendingItems; // Leaf - Defer container item decoding
+     public final ContainerOpenersCounter openersCounter = new ContainerOpenersCounter() {
+         @Override
+         protected void onOpen(Level level, BlockPos pos, BlockState state) {
+@@ -105,7 +106,13 @@ public class BarrelBlockEntity extends RandomizableContainerBlockEntity implemen
+     protected void saveAdditional(ValueOutput output) {
+         super.saveAdditional(output);
+         if (!this.trySaveLootTable(output)) {
+-            ContainerHelper.saveAllItems(output, this.items);
++            // Leaf start - Defer container item decoding
++            if (this.pendingItems != null) {
++                this.pendingItems.save(output);
++            } else {
++                ContainerHelper.saveAllItems(output, this.items);
++            }
++            // Leaf end - Defer container item decoding
+         }
+     }
+ 
+@@ -113,9 +120,7 @@ public class BarrelBlockEntity extends RandomizableContainerBlockEntity implemen
+     protected void loadAdditional(ValueInput input) {
+         super.loadAdditional(input);
+         this.items = NonNullList.withSize(this.getContainerSize(), ItemStack.EMPTY);
+-        if (!this.tryLoadLootTable(input)) {
+-            ContainerHelper.loadAllItems(input, this.items);
+-        }
++        this.pendingItems = this.tryLoadLootTable(input) ? null : ContainerHelper.loadAllItemsDeferred(input, this.items); // Leaf - Defer container item decoding
+     }
+ 
+     @Override
+@@ -134,11 +139,18 @@ public class BarrelBlockEntity extends RandomizableContainerBlockEntity implemen
+ 
+     @Override
+     protected NonNullList<ItemStack> getItems() {
++        // Leaf start - Defer container item decoding
++        if (this.pendingItems != null) {
++            this.pendingItems.load(this.items, this.problemPath());
++            this.pendingItems = null;
++        }
++        // Leaf end - Defer container item decoding
+         return this.items;
+     }
+ 
+     @Override
+     protected void setItems(NonNullList<ItemStack> items) {
++        this.pendingItems = null; // Leaf - Defer container item decoding
+         this.items = items;
+         if (org.dreeam.leaf.config.modules.opt.SleepingBlockEntity.enabled) this.lithium$emitStackListReplaced(); // Leaves - Lithium Sleeping Block Entity
+     }
+@@ -205,11 +217,19 @@ public class BarrelBlockEntity extends RandomizableContainerBlockEntity implemen
+ 
+     @Override
+     public net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> getInventoryLithium() {
+-        return items;
++        return this.getItems(); // Leaf - Defer container item decoding
++    }
++
++    // Leaf start - Defer container item decoding
++    @Override
++    public NonNullList<ItemStack> getInventoryLithiumWithoutLoading() {
++        return this.items;
+     }
++    // Leaf end - Defer container item decoding
+ 
+     @Override
+     public void setInventoryLithium(net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> inventory) {
++        this.pendingItems = null; // Leaf - Defer container item decoding
+         items = inventory;
+     }
+     // Leaves end - Lithium Sleeping Block Entity
+diff --git a/net/minecraft/world/level/block/entity/ChestBlockEntity.java b/net/minecraft/world/level/block/entity/ChestBlockEntity.java
+index 37f043af6c83207f4cab57fc52447650ca744e9a..780f004561c596ca732eabe70ebfc560237afb76 100644
+--- a/net/minecraft/world/level/block/entity/ChestBlockEntity.java
++++ b/net/minecraft/world/level/block/entity/ChestBlockEntity.java
+@@ -29,6 +29,7 @@ public class ChestBlockEntity extends RandomizableContainerBlockEntity implement
+     private static final int EVENT_SET_OPEN_COUNT = 1;
+     public static final Component DEFAULT_NAME = Component.translatable("container.chest");
+     private NonNullList<ItemStack> items = NonNullList.withSize(27, ItemStack.EMPTY);
++    private ContainerHelper.@org.jspecify.annotations.Nullable PendingItems pendingItems; // Leaf - Defer container item decoding
+     public final ContainerOpenersCounter openersCounter = new ContainerOpenersCounter() {
+         @Override
+         protected void onOpen(Level level, BlockPos pos, BlockState state) {
+@@ -68,7 +69,7 @@ public class ChestBlockEntity extends RandomizableContainerBlockEntity implement
+ 
+     @Override
+     public java.util.List<net.minecraft.world.item.ItemStack> getContents() {
+-        return this.items;
++        return this.getItems(); // Leaf - Defer container item decoding
+     }
+ 
+     @Override
+@@ -118,16 +119,20 @@ public class ChestBlockEntity extends RandomizableContainerBlockEntity implement
+     protected void loadAdditional(ValueInput input) {
+         super.loadAdditional(input);
+         this.items = NonNullList.withSize(this.getContainerSize(), ItemStack.EMPTY);
+-        if (!this.tryLoadLootTable(input)) {
+-            ContainerHelper.loadAllItems(input, this.items);
+-        }
++        this.pendingItems = this.tryLoadLootTable(input) ? null : ContainerHelper.loadAllItemsDeferred(input, this.items); // Leaf - Defer container item decoding
+     }
+ 
+     @Override
+     protected void saveAdditional(ValueOutput output) {
+         super.saveAdditional(output);
+         if (!this.trySaveLootTable(output)) {
+-            ContainerHelper.saveAllItems(output, this.items);
++            // Leaf start - Defer container item decoding
++            if (this.pendingItems != null) {
++                this.pendingItems.save(output);
++            } else {
++                ContainerHelper.saveAllItems(output, this.items);
++            }
++            // Leaf end - Defer container item decoding
+         }
+     }
+ 
+@@ -185,11 +190,18 @@ public class ChestBlockEntity extends RandomizableContainerBlockEntity implement
+ 
+     @Override
+     protected NonNullList<ItemStack> getItems() {
++        // Leaf start - Defer container item decoding
++        if (this.pendingItems != null) {
++            this.pendingItems.load(this.items, this.problemPath());
++            this.pendingItems = null;
++        }
++        // Leaf end - Defer container item decoding
+         return this.items;
+     }
+ 
+     @Override
+     protected void setItems(NonNullList<ItemStack> items) {
++        this.pendingItems = null; // Leaf - Defer container item decoding
+         this.items = items;
+         if (org.dreeam.leaf.config.modules.opt.SleepingBlockEntity.enabled) this.lithium$emitStackListReplaced(); // Leaves - Lithium Sleeping Block Entity
+     }
+@@ -272,11 +284,19 @@ public class ChestBlockEntity extends RandomizableContainerBlockEntity implement
+ 
+     @Override
+     public net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> getInventoryLithium() {
+-        return items;
++        return this.getItems(); // Leaf - Defer container item decoding
++    }
++
++    // Leaf start - Defer container item decoding
++    @Override
++    public NonNullList<ItemStack> getInventoryLithiumWithoutLoading() {
++        return this.items;
+     }
++    // Leaf end - Defer container item decoding
+ 
+     @Override
+     public void setInventoryLithium(net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> inventory) {
++        this.pendingItems = null; // Leaf - Defer container item decoding
+         items = inventory;
+     }
+     // Leaves end - Lithium Sleeping Block Entity
+diff --git a/net/minecraft/world/level/block/entity/ShulkerBoxBlockEntity.java b/net/minecraft/world/level/block/entity/ShulkerBoxBlockEntity.java
+index e751683aa52da7e850f793916fdfb75b4b43297b..79244a1e0f9b11dd08597e36c3bf2e15fba345c5 100644
+--- a/net/minecraft/world/level/block/entity/ShulkerBoxBlockEntity.java
++++ b/net/minecraft/world/level/block/entity/ShulkerBoxBlockEntity.java
+@@ -43,6 +43,7 @@ public class ShulkerBoxBlockEntity extends RandomizableContainerBlockEntity impl
+     private static final int[] SLOTS = IntStream.range(0, 27).toArray();
+     private static final Component DEFAULT_NAME = Component.translatable("container.shulkerBox");
+     private NonNullList<ItemStack> itemStacks = NonNullList.withSize(27, ItemStack.EMPTY);
++    private ContainerHelper.@org.jspecify.annotations.Nullable PendingItems pendingItems; // Leaf - Defer container item decoding
+     public int openCount;
+     private ShulkerBoxBlockEntity.AnimationStatus animationStatus = ShulkerBoxBlockEntity.AnimationStatus.CLOSED;
+     private float progress;
+@@ -56,7 +57,7 @@ public class ShulkerBoxBlockEntity extends RandomizableContainerBlockEntity impl
+ 
+     @Override
+     public List<ItemStack> getContents() {
+-        return this.itemStacks;
++        return this.getItems(); // Leaf - Defer container item decoding
+     }
+ 
+     @Override
+@@ -248,24 +249,35 @@ public class ShulkerBoxBlockEntity extends RandomizableContainerBlockEntity impl
+     protected void saveAdditional(ValueOutput output) {
+         super.saveAdditional(output);
+         if (!this.trySaveLootTable(output)) {
+-            ContainerHelper.saveAllItems(output, this.itemStacks, false);
++            // Leaf start - Defer container item decoding
++            if (this.pendingItems != null) {
++                this.pendingItems.save(output);
++            } else {
++                ContainerHelper.saveAllItems(output, this.itemStacks, false);
++            }
++            // Leaf end - Defer container item decoding
+         }
+     }
+ 
+     public void loadFromTag(ValueInput input) {
+         this.itemStacks = NonNullList.withSize(this.getContainerSize(), ItemStack.EMPTY);
+-        if (!this.tryLoadLootTable(input)) {
+-            ContainerHelper.loadAllItems(input, this.itemStacks);
+-        }
++        this.pendingItems = this.tryLoadLootTable(input) ? null : ContainerHelper.loadAllItemsDeferred(input, this.itemStacks); // Leaf - Defer container item decoding
+     }
+ 
+     @Override
+     protected NonNullList<ItemStack> getItems() {
++        // Leaf start - Defer container item decoding
++        if (this.pendingItems != null) {
++            this.pendingItems.load(this.itemStacks, this.problemPath());
++            this.pendingItems = null;
++        }
++        // Leaf end - Defer container item decoding
+         return this.itemStacks;
+     }
+ 
+     @Override
+     protected void setItems(NonNullList<ItemStack> items) {
++        this.pendingItems = null; // Leaf - Defer container item decoding
+         this.itemStacks = items;
+         if (org.dreeam.leaf.config.modules.opt.SleepingBlockEntity.enabled) this.lithium$emitStackListReplaced(); // Leaves - Lithium Sleeping Block Entity
+     }
+@@ -335,11 +347,19 @@ public class ShulkerBoxBlockEntity extends RandomizableContainerBlockEntity impl
+ 
+     @Override
+     public net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> getInventoryLithium() {
+-        return itemStacks;
++        return this.getItems(); // Leaf - Defer container item decoding
++    }
++
++    // Leaf start - Defer container item decoding
++    @Override
++    public NonNullList<ItemStack> getInventoryLithiumWithoutLoading() {
++        return this.itemStacks;
+     }
++    // Leaf end - Defer container item decoding
+ 
+     @Override
+     public void setInventoryLithium(net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> inventory) {
++        this.pendingItems = null; // Leaf - Defer container item decoding
+         itemStacks = inventory;
+     }
+     // Leaves end - Lithium Sleeping Block Entity
+diff --git a/net/minecraft/world/level/block/state/BlockBehaviour.java b/net/minecraft/world/level/block/state/BlockBehaviour.java
+index b326d08dc75d01b35162cda95eda8b18b0feac39..1b01cc3b245fb08d8bc34789aeca596c56727e15 100644
+--- a/net/minecraft/world/level/block/state/BlockBehaviour.java
++++ b/net/minecraft/world/level/block/state/BlockBehaviour.java
+@@ -474,6 +474,8 @@ public abstract class BlockBehaviour implements FeatureElement, net.caffeinemc.m
+         private VoxelShape constantCollisionShape;
+         public byte pathType; // Leaf - Cache block state tags
+         public int tagFlag; // Leaf - Cache block state tags
++        public net.minecraft.core.@Nullable Holder<net.minecraft.world.entity.ai.village.poi.PoiType> leaf$poiType; // Leaf - O(1) PoiType lookup
++        public java.util.Optional<net.minecraft.core.Holder<net.minecraft.world.entity.ai.village.poi.PoiType>> leaf$poiTypeOptional = java.util.Optional.empty(); // Leaf - O(1) PoiType lookup
+ 
+         private static void initCaches(final VoxelShape shape, final boolean neighbours) {
+             ((ca.spottedleaf.moonrise.patches.collisions.shape.CollisionVoxelShape)shape).moonrise$isFullBlock();
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 43b5506797a52fb954a60301d41d72591427abfe..99463f24f62ae866f21d79ac5df89c4ec76169f0 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -179,7 +179,7 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+         LevelChunk.@Nullable PostLoadProcessor postLoad,
+         @Nullable BlendingData blendingData
+     ) {
+-        super(pos, data, level, PalettedContainerFactory.create(net.minecraft.server.MinecraftServer.getServer().registryAccess()), inhabitedTime, sections, blendingData); // Paper - Anti-Xray - The world isn't ready yet, use server singleton for registry
++        super(pos, data, level, level.palettedContainerFactory() != null ? level.palettedContainerFactory() : PalettedContainerFactory.create(net.minecraft.server.MinecraftServer.getServer().registryAccess()), inhabitedTime, sections, blendingData); // Paper - Anti-Xray - The world isn't ready yet, use server singleton for registry // Leaf - Reuse level PalettedContainerFactory
+         this.level = (ServerLevel) level; // CraftBukkit - type
+         this.gameEventListenerRegistrySections = new GameEventListenerRegistry[getGameEventSectionLength(this.getSectionsCount())]; // Leaf - petal - reduce work done by game event system
+ 
+diff --git a/net/minecraft/world/level/chunk/PalettedContainerFactory.java b/net/minecraft/world/level/chunk/PalettedContainerFactory.java
+index 4240b4acccce2df627d1b5bde6c447676ff942b8..82d10acabf61eba11f983aa54f650ace42baf0a9 100644
+--- a/net/minecraft/world/level/chunk/PalettedContainerFactory.java
++++ b/net/minecraft/world/level/chunk/PalettedContainerFactory.java
+@@ -20,7 +20,26 @@ public record PalettedContainerFactory(
+     Codec<PalettedContainerRO<Holder<Biome>>> biomeContainerCodec
+     , Codec<PalettedContainer<Holder<Biome>>> biomeContainerRWCodec // Paper
+ ) {
++    // Leaf start - Cache PalettedContainerFactory per RegistryAccess.Frozen
++    private static final java.util.concurrent.ConcurrentMap<RegistryAccess, PalettedContainerFactory> FACTORY_CACHE = new com.google.common.collect.MapMaker()
++        .weakKeys()
++        .makeMap();
++
+     public static PalettedContainerFactory create(RegistryAccess registryAccess) {
++        if (registryAccess instanceof RegistryAccess.Frozen) {
++            PalettedContainerFactory cached = FACTORY_CACHE.get(registryAccess);
++            if (cached != null) {
++                return cached;
++            }
++            PalettedContainerFactory created = createUncached(registryAccess);
++            PalettedContainerFactory existing = FACTORY_CACHE.putIfAbsent(registryAccess, created);
++            return existing != null ? existing : created;
++        }
++        return createUncached(registryAccess);
++    }
++
++    private static PalettedContainerFactory createUncached(RegistryAccess registryAccess) {
++    // Leaf end - Cache PalettedContainerFactory per RegistryAccess.Frozen
+         Strategy<BlockState> strategy = Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY);
+         BlockState blockState = Blocks.AIR.defaultBlockState();
+         Registry<Biome> registry = registryAccess.lookupOrThrow(Registries.BIOME);
+diff --git a/net/minecraft/world/level/pathfinder/AmphibiousNodeEvaluator.java b/net/minecraft/world/level/pathfinder/AmphibiousNodeEvaluator.java
+index 915536f109712ccd4f6c20a5667817e183f226f3..2fb22c36cba42001c573d98470ec05cf19406b6a 100644
+--- a/net/minecraft/world/level/pathfinder/AmphibiousNodeEvaluator.java
++++ b/net/minecraft/world/level/pathfinder/AmphibiousNodeEvaluator.java
+@@ -19,20 +19,27 @@ public class AmphibiousNodeEvaluator extends WalkNodeEvaluator {
+     @Override
+     public void prepare(PathNavigationRegion level, Mob mob) {
+         super.prepare(level, mob);
+-        mob.setPathfindingMalus(PathType.WATER, 0.0F);
+-        this.oldWalkableCost = mob.getPathfindingMalus(PathType.WALKABLE);
+-        mob.setPathfindingMalus(PathType.WALKABLE, 6.0F);
+-        this.oldWaterBorderCost = mob.getPathfindingMalus(PathType.WATER_BORDER);
+-        mob.setPathfindingMalus(PathType.WATER_BORDER, 4.0F);
+     }
+ 
+     @Override
+     public void done() {
+-        this.mob.setPathfindingMalus(PathType.WALKABLE, this.oldWalkableCost);
+-        this.mob.setPathfindingMalus(PathType.WATER_BORDER, this.oldWaterBorderCost);
+         super.done();
+     }
+ 
++    // Leaf start - isolated amphibious malus without mutating entity
++    @Override
++    public float getPathfindingMalus(PathType pathType) {
++        if (pathType == PathType.WATER) {
++            return 0.0F;
++        } else if (pathType == PathType.WALKABLE) {
++            return 6.0F;
++        } else if (pathType == PathType.WATER_BORDER) {
++            return 4.0F;
++        }
++        return super.getPathfindingMalus(pathType);
++    }
++    // Leaf end - isolated amphibious malus without mutating entity
++
+     @Override
+     public Node getStart() {
+         return !this.mob.isInWater()
+@@ -55,7 +62,7 @@ public class AmphibiousNodeEvaluator extends WalkNodeEvaluator {
+         PathType cachedPathType = this.getCachedPathType(node.x, node.y + 1, node.z);
+         PathType cachedPathType1 = this.getCachedPathType(node.x, node.y, node.z);
+         int floor;
+-        if (this.mob.getPathfindingMalus(cachedPathType) >= 0.0F && cachedPathType1 != PathType.STICKY_HONEY) {
++        if (this.getPathfindingMalus(cachedPathType) >= 0.0F && cachedPathType1 != PathType.STICKY_HONEY) {
+             floor = Mth.floor(Math.max(1.0F, this.mob.maxUpStep()));
+         } else {
+             floor = 0;
+diff --git a/net/minecraft/world/level/pathfinder/NodeEvaluator.java b/net/minecraft/world/level/pathfinder/NodeEvaluator.java
+index 0373305a50d1ca5b1b20e74fa531287cf81d985c..2b81bf86a93f5314d05282ee253f813ab2c26749 100644
+--- a/net/minecraft/world/level/pathfinder/NodeEvaluator.java
++++ b/net/minecraft/world/level/pathfinder/NodeEvaluator.java
+@@ -48,6 +48,12 @@ public abstract class NodeEvaluator {
+     }
+     // Kaiiju end - petal - async path processing
+ 
++    // Leaf start - isolated pathfinding malus
++    public float getPathfindingMalus(PathType pathType) {
++        return this.mob != null ? this.mob.getPathfindingMalus(pathType) : pathType.getMalus();
++    }
++    // Leaf end - isolated pathfinding malus
++
+     protected Node getNode(BlockPos pos) {
+         return this.getNode(pos.getX(), pos.getY(), pos.getZ());
+     }
+diff --git a/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java b/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java
+index fc32ab016c3c4cbc17de029734e7f253f6df2372..6a0dbf206d5d6f82a4ecb7842eae56ba400dcd11 100644
+--- a/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java
++++ b/net/minecraft/world/level/pathfinder/WalkNodeEvaluator.java
+@@ -103,13 +103,13 @@ public class WalkNodeEvaluator extends NodeEvaluator {
+     protected Node getStartNode(BlockPos pos) {
+         Node node = this.getNode(pos);
+         node.type = this.getCachedPathType(node.x, node.y, node.z);
+-        node.costMalus = this.mob.getPathfindingMalus(node.type);
++        node.costMalus = this.getPathfindingMalus(node.type);
+         return node;
+     }
+ 
+     protected boolean canStartAt(BlockPos pos) {
+         PathType cachedPathType = this.getCachedPathType(pos.getX(), pos.getY(), pos.getZ());
+-        return cachedPathType != PathType.OPEN && this.mob.getPathfindingMalus(cachedPathType) >= 0.0F;
++        return cachedPathType != PathType.OPEN && this.getPathfindingMalus(cachedPathType) >= 0.0F;
+     }
+ 
+     @Override
+@@ -123,7 +123,7 @@ public class WalkNodeEvaluator extends NodeEvaluator {
+         int i1 = 0;
+         PathType cachedPathType = this.getCachedPathType(node.x, node.y + 1, node.z);
+         PathType cachedPathType1 = this.getCachedPathType(node.x, node.y, node.z);
+-        if (this.mob.getPathfindingMalus(cachedPathType) >= 0.0F && cachedPathType1 != PathType.STICKY_HONEY) {
++        if (this.getPathfindingMalus(cachedPathType) >= 0.0F && cachedPathType1 != PathType.STICKY_HONEY) {
+             i1 = Mth.floor(Math.max(1.0F, this.mob.maxUpStep()));
+         }
+ 
+@@ -226,7 +226,7 @@ public class WalkNodeEvaluator extends NodeEvaluator {
+             return null;
+         } else {
+             PathType cachedPathType = this.getCachedPathType(x, y, z);
+-            float pathfindingMalus = this.mob.getPathfindingMalus(cachedPathType);
++            float pathfindingMalus = this.getPathfindingMalus(cachedPathType);
+             if (pathfindingMalus >= 0.0F) {
+                 node = this.getNodeAndUpdateCostToMax(x, y, z, cachedPathType, pathfindingMalus);
+             }
+@@ -319,7 +319,7 @@ public class WalkNodeEvaluator extends NodeEvaluator {
+                 return node;
+             }
+ 
+-            node = this.getNodeAndUpdateCostToMax(x, y, z, cachedPathType, this.mob.getPathfindingMalus(cachedPathType));
++            node = this.getNodeAndUpdateCostToMax(x, y, z, cachedPathType, this.getPathfindingMalus(cachedPathType));
+             y--;
+         }
+ 
+@@ -333,7 +333,7 @@ public class WalkNodeEvaluator extends NodeEvaluator {
+             }
+ 
+             PathType cachedPathType = this.getCachedPathType(x, i, z);
+-            float pathfindingMalus = this.mob.getPathfindingMalus(cachedPathType);
++            float pathfindingMalus = this.getPathfindingMalus(cachedPathType);
+             if (cachedPathType != PathType.OPEN) {
+                 if (pathfindingMalus >= 0.0F) {
+                     return this.getNodeAndUpdateCostToMax(x, i, z, cachedPathType, pathfindingMalus);
+@@ -365,18 +365,21 @@ public class WalkNodeEvaluator extends NodeEvaluator {
+             PathType pathType = PathType.BLOCKED;
+ 
+             for (PathType pathType1 : pathTypeWithinMobBb) {
+-                if (mob.getPathfindingMalus(pathType1) < 0.0F) {
++                float malus1 = (mob == this.mob) ? this.getPathfindingMalus(pathType1) : mob.getPathfindingMalus(pathType1);
++                if (malus1 < 0.0F) {
+                     return pathType1;
+                 }
+ 
+-                if (mob.getPathfindingMalus(pathType1) >= mob.getPathfindingMalus(pathType)) {
++                float currentMalus = (mob == this.mob) ? this.getPathfindingMalus(pathType) : mob.getPathfindingMalus(pathType);
++                if (malus1 >= currentMalus) {
+                     pathType = pathType1;
+                 }
+             }
+ 
++            float finalMalus = (mob == this.mob) ? this.getPathfindingMalus(pathType) : mob.getPathfindingMalus(pathType);
+             return this.entityWidth <= 1
+                     && pathType != PathType.OPEN
+-                    && mob.getPathfindingMalus(pathType) == 0.0F
++                    && finalMalus == 0.0F
+                     && this.getPathType(context, x, y, z) == PathType.OPEN
+                 ? PathType.OPEN
+                 : pathType;
+diff --git a/net/minecraft/world/level/storage/LevelStorageSource.java b/net/minecraft/world/level/storage/LevelStorageSource.java
+index d5e9190f0a6baffd2b08225f595ff4d7eb662e65..79161b738daa7898ff25d8cce0e1efae864aecdf 100644
+--- a/net/minecraft/world/level/storage/LevelStorageSource.java
++++ b/net/minecraft/world/level/storage/LevelStorageSource.java
+@@ -523,8 +523,9 @@ public class LevelStorageSource {
+                 NbtIo.writeCompressed(tag, nbtBytes);
+             } catch (Exception var6) {
+                 LevelStorageSource.LOGGER.error("Failed to encode level {}", path, var6);
++                return;
+             }
+-            org.dreeam.leaf.async.AsyncPlayerDataSaving.submit(() -> {
++            org.dreeam.leaf.async.AsyncPlayerDataSaving.submitLevelSave(() -> {
+                 try {
+                     Path path1 = Files.createTempFile(path, "level", ".dat");
+                     org.apache.commons.io.FileUtils.writeByteArrayToFile(path1.toFile(), nbtBytes.array, 0, nbtBytes.length, false);
+diff --git a/net/minecraft/world/level/storage/PlayerDataStorage.java b/net/minecraft/world/level/storage/PlayerDataStorage.java
+index 1d5666b7b5167b607b13874830fa7b33f22c945a..9571e93842abc94036a1c1868844ee89e1040098 100644
+--- a/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -24,6 +24,13 @@ public class PlayerDataStorage {
+     private final File playerDir;
+     protected final DataFixer fixerUpper;
+     private final java.util.Map<java.util.UUID, java.util.concurrent.Future<?>> savingLocks = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap<>(); // Leaf - Async playerdata saving
++    // Leaf start - Async player.dat preloading during login handshake
++    public static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, Optional<CompoundTag>> PRELOADED_PLAYER_DATA = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, Long> PRELOADED_TIMESTAMPS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, java.util.concurrent.CompletableFuture<Optional<CompoundTag>>> PRELOAD_FUTURES = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, java.util.concurrent.atomic.AtomicLong> SAVE_GENERATIONS = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final long PRELOAD_TTL_MS = 120_000L;
++    // Leaf end - Async player.dat preloading during login handshake
+ 
+     public PlayerDataStorage(LevelStorageSource.LevelStorageAccess levelStorageAccess, DataFixer fixerUpper) {
+         this.fixerUpper = fixerUpper;
+@@ -50,65 +57,33 @@ public class PlayerDataStorage {
+ 
+     // Leaf start - Async playerdata saving
+     public void save(String playerName, java.util.UUID uniqueId, String stringId, CompoundTag compoundTag) {
++        if (uniqueId != null) {
++            SAVE_GENERATIONS.computeIfAbsent(uniqueId, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
++            clearPreloaded(uniqueId);
++        }
+         var nbtBytes = new it.unimi.dsi.fastutil.io.FastByteArrayOutputStream(65536);
+         try {
+             NbtIo.writeCompressed(compoundTag, nbtBytes);
+         } catch (Exception exception) {
+             LOGGER.warn("Failed to encode player data for {}", stringId, exception);
+-        }
+-        lockFor(uniqueId, playerName);
+-        synchronized (PlayerDataStorage.this) {
+-            org.dreeam.leaf.async.AsyncPlayerDataSaving.submit(() -> {
+-                try {
+-                    Path path = this.playerDir.toPath();
+-                    Path path1 = Files.createTempFile(path, stringId + "-", ".dat");
+-                    org.apache.commons.io.FileUtils.writeByteArrayToFile(path1.toFile(), nbtBytes.array, 0, nbtBytes.length, false);
+-                    Path path2 = path.resolve(stringId + ".dat");
+-                    Path path3 = path.resolve(stringId + ".dat_old");
+-                    Util.safeReplaceFile(path2, path1, path3);
+-                } catch (Exception var7) {
+-                    LOGGER.warn("Failed to save player data for {}", playerName, var7);
+-                } finally {
+-                    synchronized (PlayerDataStorage.this) {
+-                        savingLocks.remove(uniqueId);
+-                    }
+-                }
+-            }).ifPresent(future -> savingLocks.put(uniqueId, future));
+-        }
+-    }
+-
+-    private void lockFor(java.util.UUID uniqueId, String playerName) {
+-        java.util.concurrent.Future<?> fut;
+-        synchronized (this) {
+-            fut = savingLocks.get(uniqueId);
+-        }
+-        if (fut == null) {
+             return;
+         }
+-        while (true) {
++        org.dreeam.leaf.async.AsyncPlayerDataSaving.submitPlayerSave(uniqueId, () -> {
+             try {
+-                fut.get(10_000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+-                break;
+-            } catch (InterruptedException ignored) {
+-            } catch (java.util.concurrent.ExecutionException
+-                     | java.util.concurrent.TimeoutException exception) {
+-                LOGGER.warn("Failed to save player data for {}", playerName, exception);
+-
+-                String threadDump = "";
+-                var threadMXBean = java.lang.management.ManagementFactory.getThreadMXBean();
+-                for (var threadInfo : threadMXBean.dumpAllThreads(true, true)) {
+-                    if (threadInfo.getThreadName().equals("Leaf IO Thread")) { // TODO: We should use instanceOf here
+-                        threadDump = threadInfo.toString();
+-                        break;
+-                    }
+-                }
+-                LOGGER.warn(threadDump);
+-                fut.cancel(true);
+-                break;
+-            } finally {
+-                savingLocks.remove(uniqueId);
++                Path path = this.playerDir.toPath();
++                Path path1 = Files.createTempFile(path, stringId + "-", ".dat");
++                org.apache.commons.io.FileUtils.writeByteArrayToFile(path1.toFile(), nbtBytes.array, 0, nbtBytes.length, false);
++                Path path2 = path.resolve(stringId + ".dat");
++                Path path3 = path.resolve(stringId + ".dat_old");
++                Util.safeReplaceFile(path2, path1, path3);
++            } catch (Exception var7) {
++                LOGGER.warn("Failed to save player data for {}", playerName, var7);
+             }
+-        }
++        });
++    }
++
++    private void lockFor(java.util.UUID uniqueId, String playerName) {
++        org.dreeam.leaf.async.AsyncPlayerDataSaving.awaitPendingSave(uniqueId);
+     }
+     // Leaf end - Async playerdata saving
+ 
+@@ -156,7 +131,71 @@ public class PlayerDataStorage {
+         return Optional.empty();
+     }
+ 
+-    public Optional<CompoundTag> load(NameAndId nameAndId) {
++    // Leaf start - Async player.dat preloading during login handshake
++    public static void clearPreloaded(java.util.UUID uniqueId) {
++        if (uniqueId == null) {
++            return;
++        }
++        PRELOADED_PLAYER_DATA.remove(uniqueId);
++        PRELOADED_TIMESTAMPS.remove(uniqueId);
++        java.util.concurrent.CompletableFuture<Optional<CompoundTag>> future = PRELOAD_FUTURES.remove(uniqueId);
++        if (future != null) {
++            future.cancel(false);
++        }
++        net.minecraft.stats.ServerStatsCounter.clearPreloaded(uniqueId);
++        net.minecraft.server.PlayerAdvancements.clearPreloaded(uniqueId);
++    }
++
++    public void preloadAsync(NameAndId nameAndId) {
++        java.util.UUID uuid = nameAndId.id();
++        if (uuid == null) {
++            return;
++        }
++        net.minecraft.server.MinecraftServer server = net.minecraft.server.MinecraftServer.getServer();
++        if (server != null && server.getPlayerList().getPlayer(uuid) != null) {
++            clearPreloaded(uuid);
++            return;
++        }
++
++        if (PRELOADED_PLAYER_DATA.size() > 256) {
++            long cutoff = System.currentTimeMillis() - PRELOAD_TTL_MS;
++            PRELOADED_TIMESTAMPS.forEach((k, ts) -> {
++                if (ts < cutoff) {
++                    clearPreloaded(k);
++                }
++            });
++        }
++
++        long genAtStart = SAVE_GENERATIONS.computeIfAbsent(uuid, k -> new java.util.concurrent.atomic.AtomicLong()).get();
++        java.util.concurrent.Executor executor = org.dreeam.leaf.async.AsyncPlayerDataSaving.IO_POOL != null
++            && !org.dreeam.leaf.async.AsyncPlayerDataSaving.IO_POOL.isShutdown()
++            ? org.dreeam.leaf.async.AsyncPlayerDataSaving.IO_POOL
++            : java.util.concurrent.ForkJoinPool.commonPool();
++
++        if (server != null) {
++            net.minecraft.stats.ServerStatsCounter.preloadAsync(server, uuid, executor);
++            net.minecraft.server.PlayerAdvancements.preloadAsync(server, uuid, executor);
++        }
++
++        java.util.concurrent.CompletableFuture<Optional<CompoundTag>> future = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
++            Optional<CompoundTag> loaded = this.loadFromDisk(nameAndId);
++            java.util.concurrent.atomic.AtomicLong gen = SAVE_GENERATIONS.get(uuid);
++            if ((gen == null || gen.get() == genAtStart)
++                && (server == null || server.getPlayerList().getPlayer(uuid) == null)) {
++                PRELOADED_TIMESTAMPS.put(uuid, System.currentTimeMillis());
++                PRELOADED_PLAYER_DATA.put(uuid, loaded);
++            }
++            return loaded;
++        }, executor);
++
++        java.util.concurrent.CompletableFuture<Optional<CompoundTag>> prev = PRELOAD_FUTURES.put(uuid, future);
++        if (prev != null && !prev.isDone()) {
++            prev.cancel(false);
++        }
++        future.whenComplete((res, ex) -> PRELOAD_FUTURES.remove(uuid, future));
++    }
++
++    private Optional<CompoundTag> loadFromDisk(NameAndId nameAndId) {
+         Optional<CompoundTag> optional = this.load(nameAndId, ".dat");
+         if (optional.isEmpty()) {
+             this.backup(nameAndId, ".dat");
+@@ -168,6 +207,32 @@ public class PlayerDataStorage {
+         });
+     }
+ 
++    public Optional<CompoundTag> load(NameAndId nameAndId) {
++        java.util.UUID uuid = nameAndId.id();
++        if (uuid != null) {
++            Optional<CompoundTag> preloaded = PRELOADED_PLAYER_DATA.remove(uuid);
++            Long loadedAt = PRELOADED_TIMESTAMPS.remove(uuid);
++            if (preloaded != null) {
++                PRELOAD_FUTURES.remove(uuid);
++                if (loadedAt == null || (System.currentTimeMillis() - loadedAt) <= PRELOAD_TTL_MS) {
++                    return preloaded;
++                }
++            }
++            java.util.concurrent.CompletableFuture<Optional<CompoundTag>> inFlight = PRELOAD_FUTURES.remove(uuid);
++            if (inFlight != null && !inFlight.isCancelled()) {
++                try {
++                    Optional<CompoundTag> result = inFlight.get();
++                    PRELOADED_PLAYER_DATA.remove(uuid);
++                    PRELOADED_TIMESTAMPS.remove(uuid);
++                    return result;
++                } catch (Exception ignored) {
++                }
++            }
++        }
++        return this.loadFromDisk(nameAndId);
++    }
++    // Leaf end - Async player.dat preloading during login handshake
++
+     // CraftBukkit start
+     public File getPlayerDir() {
+         return this.playerDir;
+diff --git a/net/minecraft/world/level/storage/TagValueInput.java b/net/minecraft/world/level/storage/TagValueInput.java
+index e59fd8482933afe129a39d5d4b792774c3a90667..3e62bcdf9b5a66ee835638628db2e2f04e38317a 100644
+--- a/net/minecraft/world/level/storage/TagValueInput.java
++++ b/net/minecraft/world/level/storage/TagValueInput.java
+@@ -37,6 +37,36 @@ public class TagValueInput implements ValueInput {
+         this.input = input;
+     }
+ 
++    // Leaf start - Defer container item decoding
++    public TagValueInput withProblemReporter(final ProblemReporter problemReporter) {
++        return new TagValueInput(problemReporter, this.context, this.input);
++    }
++
++    public TagValueInput retainField(final String name) {
++        CompoundTag retained = new CompoundTag();
++        Tag tag = this.input.get(name);
++        if (tag != null) {
++            retained.put(name, tag);
++        }
++        return new TagValueInput(ProblemReporter.DISCARDING, this.context, retained);
++    }
++
++    public void copyFieldTo(final String name, final ValueOutput output) {
++        Tag tag = this.input.get(name);
++        if (tag == null) return;
++        Tag value = tag.copy();
++        if (output instanceof TagValueOutput tagOutput) {
++            tagOutput.buildResult().put(name, value);
++        } else {
++            output.store(name, Codec.PASSTHROUGH, new com.mojang.serialization.Dynamic<>(NbtOps.INSTANCE, value));
++        }
++    }
++
++    public boolean hasNonEmptyList(final String key) {
++        return this.input.get(key) instanceof ListTag list && !list.isEmpty();
++    }
++    // Leaf end - Defer container item decoding
++
+     // Paper start - utility methods
+     public static ValueInput createGlobal(
+         final ProblemReporter problemReporter,

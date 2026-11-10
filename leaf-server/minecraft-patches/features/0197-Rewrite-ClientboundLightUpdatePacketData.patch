@@ -14,7 +14,7 @@ diff --git a/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketDat
 index d30828c4a287192b1110dae627f464767a9a61e9..cc5b6e5392cdd181b460dbc2200fcb2440310562 100644
 --- a/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
 +++ b/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
-@@ -16,30 +16,115 @@ import org.jspecify.annotations.Nullable;
+@@ -16,30 +16,113 @@ import org.jspecify.annotations.Nullable;
  
  public class ClientboundLightUpdatePacketData {
      private static final StreamCodec<ByteBuf, byte[]> DATA_LAYER_STREAM_CODEC = ByteBufCodecs.byteArray(2048);
@@ -119,7 +119,6 @@ index d30828c4a287192b1110dae627f464767a9a61e9..cc5b6e5392cdd181b460dbc2200fcb24
 +            // Clone only at the end to minimize work
 +            for (int i = 0; i < skyCount; i++) {
 +                this.skyUpdates[i] = skyBuffer[i].clone();
-+                skyBuffer[i] = null; // Leaf - Zero-Leak: Clear ThreadLocal reference
 +            }
 +        } else {
 +            this.skyUpdates = EMPTY_ARRAY;
@@ -130,7 +129,6 @@ index d30828c4a287192b1110dae627f464767a9a61e9..cc5b6e5392cdd181b460dbc2200fcb24
 +            // Clone only at the end to minimize work
 +            for (int i = 0; i < blockCount; i++) {
 +                this.blockUpdates[i] = blockBuffer[i].clone();
-+                blockBuffer[i] = null; // Leaf - Zero-Leak: Clear ThreadLocal reference
              }
 +        } else {
 +            this.blockUpdates = EMPTY_ARRAY;
@@ -142,7 +140,7 @@ index d30828c4a287192b1110dae627f464767a9a61e9..cc5b6e5392cdd181b460dbc2200fcb24
      }
  
      public ClientboundLightUpdatePacketData(FriendlyByteBuf buffer, int x, int z) {
-@@ -47,8 +132,30 @@ public class ClientboundLightUpdatePacketData {
+@@ -47,8 +130,30 @@ public class ClientboundLightUpdatePacketData {
          this.blockYMask = buffer.readBitSet();
          this.emptySkyYMask = buffer.readBitSet();
          this.emptyBlockYMask = buffer.readBitSet();
@@ -175,7 +173,7 @@ index d30828c4a287192b1110dae627f464767a9a61e9..cc5b6e5392cdd181b460dbc2200fcb24
      }
  
      public void write(FriendlyByteBuf buffer) {
-@@ -56,25 +163,33 @@ public class ClientboundLightUpdatePacketData {
+@@ -56,25 +161,33 @@ public class ClientboundLightUpdatePacketData {
          buffer.writeBitSet(this.blockYMask);
          buffer.writeBitSet(this.emptySkyYMask);
          buffer.writeBitSet(this.emptyBlockYMask);
@@ -223,7 +221,7 @@ index d30828c4a287192b1110dae627f464767a9a61e9..cc5b6e5392cdd181b460dbc2200fcb24
      public BitSet getSkyYMask() {
          return this.skyYMask;
      }
-@@ -84,7 +199,7 @@ public class ClientboundLightUpdatePacketData {
+@@ -84,7 +197,7 @@ public class ClientboundLightUpdatePacketData {
      }
  
      public List<byte[]> getSkyUpdates() {
@@ -232,7 +230,7 @@ index d30828c4a287192b1110dae627f464767a9a61e9..cc5b6e5392cdd181b460dbc2200fcb24
      }
  
      public BitSet getBlockYMask() {
-@@ -96,6 +211,6 @@ public class ClientboundLightUpdatePacketData {
+@@ -96,6 +209,6 @@ public class ClientboundLightUpdatePacketData {
      }
  
      public List<byte[]> getBlockUpdates() {

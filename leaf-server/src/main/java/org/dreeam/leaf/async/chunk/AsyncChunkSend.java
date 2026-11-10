@@ -9,14 +9,19 @@ import java.util.concurrent.TimeUnit;
 
 public final class AsyncChunkSend {
 
+    public static final int THREADS = Math.clamp(Runtime.getRuntime().availableProcessors() / 3, 1, 4);
+
     public static final ExecutorService POOL = new ThreadPoolExecutor(
-        1, 1, 0L, TimeUnit.MILLISECONDS,
+        THREADS, THREADS, 0L, TimeUnit.MILLISECONDS,
         new LinkedBlockingQueue<>(),
         Thread.ofPlatform()
+            .daemon()
             .priority(Thread.NORM_PRIORITY - 1)
             .uncaughtExceptionHandler(Util::onThreadException)
-            .name("Leaf Async Chunk Sender Thread")
-            .factory(),
-        new ThreadPoolExecutor.CallerRunsPolicy()
+            .name("Leaf Async Chunk Sender Thread - ", 0)
+            .factory()
     );
+
+    private AsyncChunkSend() {
+    }
 }

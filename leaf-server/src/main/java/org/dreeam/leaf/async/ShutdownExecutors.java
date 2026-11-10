@@ -22,6 +22,8 @@ public class ShutdownExecutors {
         }
 
         if (AsyncPlayerDataSaving.IO_POOL != null) {
+            LOGGER.info("Waiting for player I/O tasks to finish...");
+            AsyncPlayerDataSaving.awaitAll();
             LOGGER.info("Waiting for player I/O executor to shutdown...");
             AsyncPlayerDataSaving.IO_POOL.shutdown();
             try {
@@ -47,6 +49,20 @@ public class ShutdownExecutors {
             } catch (InterruptedException ignored) {
             }
         }
+
+        if (org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL != null) {
+            LOGGER.info("Waiting for async chunk sender pool to shutdown...");
+            org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.shutdown();
+            try {
+                org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.awaitTermination(10L, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+            }
+        }
+
+        LOGGER.info("Waiting for parallel collision pool to shutdown...");
+        org.dreeam.leaf.async.collision.ParallelCollisionDispatcher.shutdown();
+        LOGGER.info("Waiting for parallel brain sensing pool to shutdown...");
+        org.dreeam.leaf.async.ai.ParallelBrainSensingDispatcher.shutdown();
 
         org.dreeam.leaf.async.path.NodeEvaluatorCache.clear();
         org.dreeam.leaf.world.region.linear.LinearV3ZstdContextPool.shutdown();

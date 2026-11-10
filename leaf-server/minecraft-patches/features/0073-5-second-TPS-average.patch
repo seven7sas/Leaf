@@ -92,18 +92,6 @@ index 22cb2e73a314e7cc6e77acfefe21f1ad195c5aec..586b9d8a438175ac8f20ae1bd70e1416
 +        }
 +    }
 +
-+    // Leaf start - Purpur lagging check optimization - compute only 5s window
-+    private double getTPS5s() {
-+        synchronized (this.statsLock) {
-+            final double[] tps5s = this.tps5s;
-+            if (tps5s != null) {
-+                return tps5s[0];
-+            }
-+            return getTPS(this.tickTimes5s, this.tickRateManager().nanosecondsPerTick());
-+        }
-+    }
-+    // Leaf end - Purpur lagging check optimization - compute only 5s window
-+
 +    public double[] computeTPSIncluding5Seconds() {
 +        final long interval = this.tickRateManager().nanosecondsPerTick();
 +        return new double[] {
@@ -123,7 +111,7 @@ index 22cb2e73a314e7cc6e77acfefe21f1ad195c5aec..586b9d8a438175ac8f20ae1bd70e1416
                      );
  
 -                    lagging = getTPS()[0] < org.purpurmc.purpur.PurpurConfig.laggingThreshold; // Purpur - Lagging threshold
-+                    lagging = this.getTPS5s() < org.purpurmc.purpur.PurpurConfig.laggingThreshold; // Purpur - Lagging threshold // Gale - Purpur - 5 second TPS average // Leaf - compute only 5s window
++                    lagging = getTPSIncluding5SecondsReadOnly()[0] < org.purpurmc.purpur.PurpurConfig.laggingThreshold; // Purpur - Lagging threshold // Gale - Purpur - 5 second TPS average
  
                      // adjust ticksBehind so that it is not greater-than catchup
                      if (ticksBehind > catchup) {

@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 seven7sas (Fork Leaf - https://github.com/seven7sas/Leaf)
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
 package org.dreeam.leaf.world.region.linear;
 
 import org.junit.jupiter.api.AfterAll;

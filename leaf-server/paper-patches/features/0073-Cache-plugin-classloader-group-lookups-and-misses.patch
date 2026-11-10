@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Wed, 11 Nov 2026 02:00:03 +0300
+Subject: [PATCH] Cache plugin classloader group lookups and misses
+
+Copyright (c) 2026 seven7sas (Fork Leaf - https://github.com/seven7sas/Leaf)
+SPDX-License-Identifier: GPL-3.0-only
+
+diff --git a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/DependencyBasedPluginClassLoaderGroup.java b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/DependencyBasedPluginClassLoaderGroup.java
+index eaf5c794cbe8d6138c9d60eaae20f5fc7711f541..84a1cf42f66236b3fc34983b74f17f1977a72222 100644
+--- a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/DependencyBasedPluginClassLoaderGroup.java
++++ b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/DependencyBasedPluginClassLoaderGroup.java
+@@ -22,13 +22,14 @@ public class DependencyBasedPluginClassLoaderGroup extends SimpleListPluginClass
+      * This will refresh the dependencies of the current classloader.
+      */
+     public void populateDependencies() {
++        this.invalidateLookupCache();
+         this.classloaders.clear();
+         for (ConfiguredPluginClassLoader configuredPluginClassLoader : this.globalPluginClassLoaderGroup.getClassLoaders()) {
+             if (this.access.canAccess(configuredPluginClassLoader)) {
+                 this.classloaders.add(configuredPluginClassLoader);
+             }
+         }
+-
++        this.invalidateLookupCache();
+     }
+ 
+     @Override
+diff --git a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SimpleListPluginClassLoaderGroup.java b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SimpleListPluginClassLoaderGroup.java
+index 23b6cb297f46c9c2b2944a3ab4031c31414620ad..d0f99b1d328dcb6a273cf7ab401259496ac78464 100644
+--- a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SimpleListPluginClassLoaderGroup.java
++++ b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SimpleListPluginClassLoaderGroup.java
+@@ -6,14 +6,31 @@ import org.jetbrains.annotations.ApiStatus;
+ import org.jetbrains.annotations.Nullable;
+ 
+ import java.util.List;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ @ApiStatus.Internal
+ public abstract class SimpleListPluginClassLoaderGroup implements PluginClassLoaderGroup {
+ 
+     private static final boolean DISABLE_CLASS_PRIORITIZATION = Boolean.getBoolean("Paper.DisableClassPrioritization");
++    private static final int MAX_CACHED_MISSES = 8192;
++    private static final int MAX_CACHED_OWNERS = 4096;
++
++    private static final class LookupCache {
++        final long generation;
++        final Set<String> misses = ConcurrentHashMap.newKeySet();
++        final ConcurrentHashMap<String, ConfiguredPluginClassLoader> owners = new ConcurrentHashMap<>();
++
++        LookupCache(long generation) {
++            this.generation = generation;
++        }
++    }
+ 
+     protected final List<ConfiguredPluginClassLoader> classloaders;
++    private final AtomicLong lookupGeneration = new AtomicLong();
++    private volatile LookupCache lookupCache = new LookupCache(0L);
+ 
+     protected SimpleListPluginClassLoaderGroup() {
+         this(new CopyOnWriteArrayList<>());
+@@ -23,8 +40,28 @@ public abstract class SimpleListPluginClassLoaderGroup implements PluginClassLoa
+         this.classloaders = classloaders;
+     }
+ 
++    protected long getLookupGeneration() {
++        return this.lookupGeneration.get();
++    }
++
++    protected void invalidateLookupCache() {
++        this.lookupCache = new LookupCache(this.lookupGeneration.incrementAndGet());
++    }
++
++    private LookupCache getOrRefreshCache(long generation) {
++        LookupCache cache = this.lookupCache;
++        if (cache.generation != generation) {
++            cache = new LookupCache(generation);
++            this.lookupCache = cache;
++        }
++        return cache;
++    }
++
+     @Override
+     public @Nullable Class<?> getClassByName(String name, boolean resolve, ConfiguredPluginClassLoader requester) {
++        if (name == null) {
++            return null;
++        }
+         if (!DISABLE_CLASS_PRIORITIZATION) {
+             try {
+                 return this.lookupClass(name, false, requester); // First check the requester
+@@ -32,13 +69,43 @@ public abstract class SimpleListPluginClassLoaderGroup implements PluginClassLoa
+             }
+         }
+ 
++        // Leaf start - Negative and owner lookup cache for plugin classloader group
++        final long generation = this.getLookupGeneration();
++        final LookupCache cache = this.getOrRefreshCache(generation);
++
++        if (cache.misses.contains(name) && this.getLookupGeneration() == generation) {
++            return null;
++        }
++
++        ConfiguredPluginClassLoader cachedOwner = cache.owners.get(name);
++        if (cachedOwner != null) {
++            try {
++                return this.lookupClass(name, resolve, cachedOwner);
++            } catch (ClassNotFoundException ignored) {
++                cache.owners.remove(name, cachedOwner);
++            }
++        }
++
+         for (ConfiguredPluginClassLoader loader : this.classloaders) {
++            if (!DISABLE_CLASS_PRIORITIZATION && !resolve && loader == requester) {
++                continue;
++            }
+             try {
+-                return this.lookupClass(name, resolve, loader);
++                Class<?> loaded = this.lookupClass(name, resolve, loader);
++                if (this.getLookupGeneration() == generation && cache.owners.size() < MAX_CACHED_OWNERS) {
++                    cache.owners.putIfAbsent(name, loader);
++                }
++                cache.misses.remove(name);
++                return loaded;
+             } catch (ClassNotFoundException ignored) {
+             }
+         }
+ 
++        if (this.getLookupGeneration() == generation && cache.misses.size() < MAX_CACHED_MISSES) {
++            cache.misses.add(name);
++        }
++        // Leaf end - Negative and owner lookup cache for plugin classloader group
++
+         return null;
+     }
+ 
+@@ -49,11 +116,13 @@ public abstract class SimpleListPluginClassLoaderGroup implements PluginClassLoa
+     @Override
+     public void remove(ConfiguredPluginClassLoader configuredPluginClassLoader) {
+         this.classloaders.remove(configuredPluginClassLoader);
++        this.invalidateLookupCache();
+     }
+ 
+     @Override
+     public void add(ConfiguredPluginClassLoader configuredPluginClassLoader) {
+         this.classloaders.add(configuredPluginClassLoader);
++        this.invalidateLookupCache();
+     }
+ 
+     public List<ConfiguredPluginClassLoader> getClassLoaders() {
+diff --git a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SpigotPluginClassLoaderGroup.java b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SpigotPluginClassLoaderGroup.java
+index 5a9f5b18e24a89dd642149a7a3d49390328b864b..58eeea88dcd76be1f88d7c06c634c7450b412a81 100644
+--- a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SpigotPluginClassLoaderGroup.java
++++ b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/SpigotPluginClassLoaderGroup.java
+@@ -14,15 +14,22 @@ import java.util.function.Predicate;
+ @ApiStatus.Internal
+ public class SpigotPluginClassLoaderGroup extends SimpleListPluginClassLoaderGroup {
+ 
++    private final GlobalPluginClassLoaderGroup globalPluginClassLoaderGroup;
+     private final Predicate<ConfiguredPluginClassLoader> libraryClassloaderPredicate;
+     private final PluginClassLoader pluginClassLoader;
+ 
+     public SpigotPluginClassLoaderGroup(GlobalPluginClassLoaderGroup globalPluginClassLoaderGroup, Predicate<ConfiguredPluginClassLoader> libraryClassloaderPredicate, PluginClassLoader pluginClassLoader) {
+         super(globalPluginClassLoaderGroup.getClassLoaders());
++        this.globalPluginClassLoaderGroup = globalPluginClassLoaderGroup;
+         this.libraryClassloaderPredicate = libraryClassloaderPredicate;
+         this.pluginClassLoader = pluginClassLoader;
+     }
+ 
++    @Override
++    protected long getLookupGeneration() {
++        return this.globalPluginClassLoaderGroup.getLookupGeneration();
++    }
++
+     // Mirrors global list
+     @Override
+     public void add(ConfiguredPluginClassLoader configuredPluginClassLoader) {

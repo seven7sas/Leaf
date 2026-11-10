@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Wed, 11 Nov 2026 01:59:57 +0300
+Subject: [PATCH] Upstream hotfixes for light buffer cleanup and async mob
+ spawning guard
+
+Copyright (c) 2026 seven7sas (Fork Leaf - https://github.com/seven7sas/Leaf)
+SPDX-License-Identifier: GPL-3.0-only
+
+diff --git a/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java b/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
+index cc5b6e5392cdd181b460dbc2200fcb2440310562..b42f41e36a6b36a9981c47eea798b85e12e66aad 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
++++ b/net/minecraft/network/protocol/game/ClientboundLightUpdatePacketData.java
+@@ -105,6 +105,7 @@ public class ClientboundLightUpdatePacketData {
+             // Clone only at the end to minimize work
+             for (int i = 0; i < skyCount; i++) {
+                 this.skyUpdates[i] = skyBuffer[i].clone();
++                skyBuffer[i] = null; // Leaf - Zero-Leak: Clear ThreadLocal reference
+             }
+         } else {
+             this.skyUpdates = EMPTY_ARRAY;
+@@ -115,6 +116,7 @@ public class ClientboundLightUpdatePacketData {
+             // Clone only at the end to minimize work
+             for (int i = 0; i < blockCount; i++) {
+                 this.blockUpdates[i] = blockBuffer[i].clone();
++                blockBuffer[i] = null; // Leaf - Zero-Leak: Clear ThreadLocal reference
+             }
+         } else {
+             this.blockUpdates = EMPTY_ARRAY;
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index cc1d86567653142f3466514cdc0cb1b613b88dc3..b5585441593e8c84fa0dd34d7131a9464b0587d2 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -551,14 +551,20 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+                 final int mapped = distanceManager.getNaturalSpawnChunkCount();
+                 final Iterable<Entity> entities = this.level.getAllEntities();
+                 level.getServer().mobSpawnExecutor.submit(() -> {
+-                    // This ensures the caps are properly enforced by using the correct calculator
+-                    lastSpawnState = NaturalSpawner.createStateAsync( // Leaf - optimize mob spawning
+-                        mapped,
+-                        entities,
+-                        this.level
+-                    );
++                    try {
++                        // This ensures the caps are properly enforced by using the correct calculator
++                        lastSpawnState = NaturalSpawner.createStateAsync( // Leaf - optimize mob spawning
++                            mapped,
++                            entities,
++                            this.level
++                        );
++                    } catch (Throwable t) {
++                        lastSpawnState = null;
++                        LOGGER.error("Async mob spawn state calculation failed", t);
++                    } finally {
++                        _pufferfish_spawnCountsReady.set(true);
++                    }
+                     // Leaf end - optimize mob spawning
+-                    _pufferfish_spawnCountsReady.set(true);
+                 });
+             }
+         }

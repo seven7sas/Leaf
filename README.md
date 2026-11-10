@@ -1,156 +1,68 @@
 <img src="public/image/leaf_banner.png" alt="Leaf">
-<div align="center">
 
-[![Download](https://img.shields.io/badge/releases-blue?label=download&style=for-the-badge&colorA=19201a&colorB=298046)](https://www.leafmc.one/download)⠀
-[![Github Actions Build](https://img.shields.io/github/actions/workflow/status/Winds-Studio/Leaf/build-12111.yml?&style=for-the-badge&colorA=19201a&colorB=298046)](https://github.com/Winds-Studio/Leaf/actions)⠀
-[![Discord](https://img.shields.io/discord/1145991395388162119?label=discord&style=for-the-badge&colorA=19201a&colorB=298046)](https://discord.gg/gfgAwdSEuM)
-[![Docs](https://img.shields.io/badge/leafmc.one/docs/-blue?label=docs&style=for-the-badge&colorA=19201a&colorB=298046)](https://www.leafmc.one/docs/getting-started)
+# Fork Leaf (1.21.11)
 
-**Leaf** is a [Paper](https://papermc.io/) fork designed to be customizable and high-performance.
-</div>
+Performance fork of [Winds-Studio/Leaf](https://github.com/Winds-Studio/Leaf) and [Paper](https://papermc.io/) for Minecraft 1.21.11 (`seven7sas/Leaf`).
 
-> [!WARNING]
-> Leaf is a performance-oriented fork. Make sure to take backups **before** switching to it. Everyone is welcome to contribute optimizations or report issues to help us improve.
+Original patches and additions in this fork are licensed under [GPL-3.0-only](LICENSE.md). Anyone reusing code or patches from this repository must keep copyright notices, credit `https://github.com/seven7sas/Leaf`, and distribute derivative works under GPL-3.0.
 
-**English** | [中文](public/readme/README_CN.md)
+## What changed from upstream
 
-## 🍃 Features
-- **Based on [Paper](https://papermc.io/)** for generic performance and flexible API
-- **Async** pathfinding, mob spawning and entity tracker
-- **Various optimizations** blending from [other forks](#-credits) and our own
-- **Fully compatible** with Spigot and Paper plugins
-- **Latest dependencies**, keeping all dependencies up-to-date
-- **Allows all characters in usernames**, including Chinese and other characters
-- **Fixes** some Minecraft bugs
-- **Mod Protocols** support
-- **More customized** relying on features of [Purpur](https://github.com/PurpurMC/Purpur)
-- **Linear region file format**, to save disk space
-- **Maintenance friendly**, integrating with [Sentry](https://sentry.io/welcome/) of [Pufferfish](https://github.com/pufferfish-gg/Pufferfish) to easily track all errors coming from your server in extreme detail
-- And more...
+### Storage and memory
+- Added `LINEAR_V3` region format (`LinearV3RegionFile`) using Zstandard compression with thread-local JNI context pooling (`LinearV3ZstdContextPool`) and automatic migration (`LinearV3MigrationHelper`) to avoid native memory leaks and G1GC humongous allocations. Added `-DLeaf.linear-v2-read-only=true` inspection mode.
+- Added experimental lazy item NBT decoding for chests, trapped chests, barrels, and shulker boxes (`ContainerItemLazyLoading`, `LithiumInventory`) that defers item parsing until the inventory is opened.
+- Cleared `ThreadLocal` buffer references after cloning in `ClientboundLightUpdatePacketData` and fixed array retention in `CachedOrNewBitsGetter`.
 
-## 📈 bStats
-[![bStats Graph Data](https://bstats.org/signatures/server-implementation/Leaf.svg)](https://bstats.org/plugin/server-implementation/Leaf)
+### Chunk loading and player join
+- Prioritized chunk sending along the player's movement vector (`PredictiveChunkConfig` velocity cone) in `AsyncChunkSender` and `RegionizedPlayerChunkLoader`.
+- Ramped up chunk loading, ticking, and sending queues on join, respawn, and long teleports without shrinking `SingleUserAreaMap` radii (avoids unloading and re-sending already loaded chunks).
+- Moved `player.dat` (`PlayerDataStorage`), `stats/<uuid>.json` (`ServerStatsCounter`), and `advancements/<uuid>.json` (`PlayerAdvancements`) disk reads, decompression, `MCDataConverter` / `DataFixer` passes, and JSON parsing onto `AsyncPlayerDataSaving.IO_POOL` virtual threads during login handshake, with generation checks, pending-save waiting, TTL eviction, and disconnect cleanup.
+- Cached `PalettedContainerFactory` per `RegistryAccess.Frozen` and reused `level.palettedContainerFactory()` in `LevelChunk`.
+- Linked `Criterion` trigger instance `hashCode()` at datapack load, cached `hashCode()` inside `CriterionTrigger.Listener`, and skipped listener allocation for `ImpossibleTrigger`.
+- Cached `leaf$poiType` directly on `BlockStateBase` and replaced `sectionPos.blocksInside()` stream/Optional usage in `PoiManager#updateFromSection` with a direct 0..15 loop.
+- Replaced full-world entity list scans in `ChunkMap` with tracked entity collections (`leaf$trackedEntities`).
 
-## 📫 Contact
-- Discord: [`https://discord.com/invite/gfgAwdSEuM`](https://discord.com/invite/gfgAwdSEuM)
-- QQ Group: `619278377`
+### Async systems and classloading
+- Added off-thread mob brain sensor evaluation (`ParallelBrainSensingDispatcher`) and thread-safe pathfinding node evaluator caching (`NodeEvaluatorCache`, `WalkNodeEvaluator`, `AmphibiousNodeEvaluator`).
+- Added split-phase parallel entity push collisions (`ParallelCollisionDispatcher`).
+- Allowed non-blocking async reads for `ServerLevel#getEntities`, `CraftWorld`, and `CraftEntity#getNearbyEntities` by removing main-thread `AsyncCatcher` guards on reads and hardening `ChunkEntitySlices` array iteration against concurrent swap-remove mutations.
+- Added generation-versioned miss and defining-loader caches (`LookupCache`) in `SimpleListPluginClassLoaderGroup`, `SpigotPluginClassLoaderGroup`, and `DependencyBasedPluginClassLoaderGroup` to eliminate repeated `ClassNotFoundException` scans across plugins.
 
-## 📫 Donation
-If you love our work, feel free to donate via our [Open Collective](https://opencollective.com/Winds-Studio) or [Dreeam's AFDIAN](https://afdian.com/a/Dreeam) :)
+### Tick loop and misc fixes
+- Added option to skip `PlayerMoveEvent` on pure camera rotation (yaw/pitch change only). Enabled `Leaf.enableFMA` by default.
+- Optimized Purpur lagging check to read only the 5-second TPS buffer (`getTPS5s()`).
+- Added early return in `ServerLevel#tickPrecipitation` when not raining and the block below is not water.
+- Wrapped async mob spawn state calculation (`ServerChunkCache`) in `try-catch-finally`, and added world task draining plus main-thread ownership restoration in `MinecraftServer` parallel world ticking.
 
-## 📥 Download
-Download Leaf from our [Website](https://www.leafmc.one/download) or get latest build in [GitHub Releases](https://github.com/Winds-Studio/Leaf/releases)
+## Config (`config/leaf-global.yml`)
 
-## 📄 Documentation
-Documentation about how to use/configure Leaf: [Leaf Docs](https://www.leafmc.one/docs/getting-started)
+- `async.parallel-brain-sensing` (default `true`) - run mob brain sensing off-thread when entity counts are high
+- `async.parallel-collisions` (default `true`) - split-phase parallel entity push collision checks
+- `perf.chunk-loading.predictive-velocity-cone-send` (default `true`) - prioritize chunks in movement direction
+- `perf.chunk-loading.smooth-spawn-ramp-up` (default `true`) - ramp up spawn/teleport chunk queues gradually
+- `perf.skip-move-event-on-rotation-only` (default `true`) - skip `PlayerMoveEvent` when position did not change
+- `perf.container-item-lazy-loading` (default `false`) - defer decoding container items until inventory access
+- `misc.region-format.format-name` - `MCA`, `B_LINEAR`, `LINEAR_V2`, or `LINEAR_V3`
 
-## 📦 Building
-Building a Paperclip JAR for distribution:
+## Building
+
+Requires JDK 21:
+
+```bash
+./gradlew applyAllPatches && ./gradlew :leaf-server:createMojmapBundlerJar
+```
+
+Or build a Paperclip jar:
+
 ```bash
 ./gradlew applyAllPatches && ./gradlew createMojmapPaperclipJar
 ```
 
+## License
 
-## 📦 API
-<details>
-<summary>Click to expand</summary>
+Additions and modifications in this fork are Copyright (c) 2026 seven7sas and licensed under [GPL-3.0-only](LICENSE.md).
+Upstream Leaf, Paper, and Paperweight components keep their original licenses (`MIT`, `GPL-3.0`, `LGPL-3.0`, `Apache-2.0`); see [LICENSE.md](LICENSE.md) and [`licenses/`](licenses/).
 
-### Maven
-```xml
-<repository>
-    <id>leafmc</id>
-    <url>https://maven.leafmc.one/snapshots/</url>
-</repository>
-```
-```xml
-<dependency>
-    <groupId>cn.dreeam.leaf</groupId>
-    <artifactId>leaf-api</artifactId>
-    <version>1.21.11-R0.1-SNAPSHOT</version>
-    <scope>provided</scope>
-</dependency>
-```
-### Gradle
-```kotlin
-repositories {
-  maven {
-    url = uri("https://maven.leafmc.one/snapshots/")
-  }
-}
+## Credits
 
-dependencies {
-    compileOnly("cn.dreeam.leaf:leaf-api:1.21.11-R0.1-SNAPSHOT")
-}
-
-java {
-  toolchain.languageVersion.set(JavaLanguageVersion.of(21))
-}
-```
-</details>
-
-## ⚖️ License
-Leaf is licensed under various open source licenses from its upstream projects. See [LICENSE.md](LICENSE.md) for full details.
-
-## 📜 Credits
-Thanks to these projects below. Leaf includes some patches taken from them.<br>
-If these excellent projects hadn't existed, Leaf wouldn't have become great.
-
-- [Gale](https://github.com/Dreeam-qwq/Gale) ([Original Repo](https://github.com/GaleMC/Gale))
-- [Pufferfish](https://github.com/pufferfish-gg/Pufferfish)
-- [Purpur](https://github.com/PurpurMC/Purpur)
-- <details>
-    <summary>🍴 Expand to see forks that Leaf takes patches from.</summary>
-    <p>
-      • <a href="https://github.com/KeYiMC/KeYi">KeYi</a> (R.I.P.)
-        <a href="https://github.com/MikuMC/KeYiBackup">(Backup)</a><br>
-      • <a href="https://github.com/etil2jz/Mirai">Mirai</a><br>
-      • <a href="https://github.com/Bloom-host/Petal">Petal</a><br>
-      • <a href="https://github.com/fxmorin/carpet-fixes">Carpet Fixes</a><br>
-      • <a href="https://github.com/Akarin-project/Akarin">Akarin</a><br>
-      • <a href="https://github.com/Cryptite/Slice">Slice</a><br>
-      • <a href="https://github.com/ProjectEdenGG/Parchment">Parchment</a><br>
-      • <a href="https://github.com/LeavesMC/Leaves">Leaves</a><br>
-      • <a href="https://github.com/KaiijuMC/Kaiiju">Kaiiju</a><br>
-      • <a href="https://github.com/PlazmaMC/PlazmaBukkit">Plazma</a><br>
-      • <a href="https://github.com/SparklyPower/SparklyPaper">SparklyPaper</a><br>
-      • <a href="https://github.com/HaHaWTH/Polpot">Polpot</a><br>
-      • <a href="https://github.com/plasmoapp/matter">Matter</a><br>
-      • <a href="https://github.com/LuminolMC/Luminol">Luminol</a><br>
-      • <a href="https://github.com/Gensokyo-Reimagined/Nitori">Nitori</a><br>
-      • <a href="https://github.com/Tuinity/Moonrise">Moonrise</a> (during 1.21.1)<br> 
-      • <a href="https://github.com/Samsuik/Sakura">Sakura</a><br> 
-    </p>
-</details>
-
-## 🔥 Special Thanks
-
-<table>
-  <tr>
-    <td width="50%" align="center">
-      <a href="https://cloud.swordsman.com.cn/?i8ab42c">
-        <img src="public/image/JiankeServer.jpg" alt="Jianke Cloud Host" width="250">
-      </a>
-      <br>
-      <b>cloud of swordsman | 剑客云</b>
-      <p>If you want to find a cheaper, high performance, stable, lower latency host, then cloud of swordsman is a good choice! Registers and purchases in <a href="https://cloud.swordsman.com.cn/?i8ab42c">here</a>.</p>
-      <p>如果你想找一个低价高性能、低延迟的云服务商，剑客云是个不错的选择！你可以在 <a href="https://cloud.swordsman.com.cn/?i8ab42c">这里</a> 注册。</p>
-    </td>
-    <td width="50%" align="center">
-      <a href="https://www.rainyun.com/NzE2NTc1_">
-        <img src="public/image/RainYun.jpg" alt="雨云" width="250">
-      </a>
-      <br>
-      <b>RainYun | 雨云</b>
-      <p>Global multi-line routing with cloud storage. Refund available within 7 days. Reliable uptime and expert support. RainYun — stable, cost-effective, and ready for fast cloud deployment. Visit <a href="https://www.rainyun.com/NzE2NTc1_">RainYun</a>.</p>
-      <p>国际多线路选择，配套云存储 — 购买服务后七天内不满意可以申请退订，强大的技术支持团队和高在线率客服。雨云云服务器，用稳定和性价比，助力您快速上云。点击前往 <a href="https://www.rainyun.com/NzE2NTc1_">雨云</a>。</p>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <a href="https://www.yourkit.com/">
-        <img src="https://www.yourkit.com/images/yklogo.png" alt="YourKit" width="300">
-      </a>
-      <p>YourKit supports open source projects with innovative and intelligent tools for monitoring and profiling Java and .NET applications. YourKit is the creator of <a href="https://www.yourkit.com/java/profiler/">YourKit Java Profiler</a>, <a href="https://www.yourkit.com/dotnet-profiler/">YourKit .NET Profiler</a>, and <a href="https://www.yourkit.com/youmonitor/">YourKit YouMonitor</a>.</p>
-    </td>
-  </tr>
-</table>
+Based on [Leaf](https://github.com/Winds-Studio/Leaf), [Paper](https://papermc.io/), [Gale](https://github.com/GaleMC/Gale), [Pufferfish](https://github.com/pufferfish-gg/Pufferfish), [Purpur](https://github.com/PurpurMC/Purpur), and the upstream projects credited in Leaf (`Mirai`, `Petal`, `Leaves`, `SparklyPaper`, `Luminol`, `Moonrise`).

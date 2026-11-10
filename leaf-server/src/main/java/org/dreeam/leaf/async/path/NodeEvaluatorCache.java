@@ -11,7 +11,7 @@ import java.util.ArrayDeque;
 
 public final class NodeEvaluatorCache {
 
-    private static final Int2ObjectOpenHashMap<ArrayDeque<NodeEvaluator>> nodeEvaluators = new Int2ObjectOpenHashMap<>();
+    private static final Object2ObjectOpenHashMap<NodeEvaluatorGenerator, Int2ObjectOpenHashMap<ArrayDeque<NodeEvaluator>>> cache = new Object2ObjectOpenHashMap<>();
     private static final Object2ObjectOpenHashMap<NodeEvaluator, NodeEvaluatorGenerator> nodeEvaluatorToGenerator = new Object2ObjectOpenHashMap<>();
 
     public static final ThreadLocal<BinaryHeap> HEAP_LOCAL = ThreadLocal.withInitial(BinaryHeap::new);
@@ -22,7 +22,9 @@ public final class NodeEvaluatorCache {
 
     public static synchronized NodeEvaluator takeNodeEvaluator(NodeEvaluatorGenerator generator, NodeEvaluator localNodeEvaluator) {
         final int nodeEvaluatorFeatures = NodeEvaluatorFeatures.fromNodeEvaluator(localNodeEvaluator);
-        NodeEvaluator nodeEvaluator = nodeEvaluators.computeIfAbsent(nodeEvaluatorFeatures, key -> new ArrayDeque<>()).poll();
+        Int2ObjectOpenHashMap<ArrayDeque<NodeEvaluator>> generatorMap = cache.computeIfAbsent(generator, k -> new Int2ObjectOpenHashMap<>());
+        ArrayDeque<NodeEvaluator> deque = generatorMap.computeIfAbsent(nodeEvaluatorFeatures, k -> new ArrayDeque<>());
+        NodeEvaluator nodeEvaluator = deque.poll();
 
         if (nodeEvaluator == null) {
             nodeEvaluator = generator.generate(NodeEvaluatorFeatures.unpack(nodeEvaluatorFeatures));
@@ -38,14 +40,15 @@ public final class NodeEvaluatorCache {
         Validate.notNull(generator, "NodeEvaluator already returned");
 
         final int feature = NodeEvaluatorFeatures.fromNodeEvaluator(nodeEvaluator);
-        ArrayDeque<NodeEvaluator> deque = nodeEvaluators.computeIfAbsent(feature, key -> new ArrayDeque<>());
+        Int2ObjectOpenHashMap<ArrayDeque<NodeEvaluator>> generatorMap = cache.computeIfAbsent(generator, k -> new Int2ObjectOpenHashMap<>());
+        ArrayDeque<NodeEvaluator> deque = generatorMap.computeIfAbsent(feature, k -> new ArrayDeque<>());
         if (deque.size() < 64) {
             deque.offer(nodeEvaluator);
         }
     }
 
     public static synchronized void clear() {
-        nodeEvaluators.clear();
+        cache.clear();
         nodeEvaluatorToGenerator.clear();
     }
 

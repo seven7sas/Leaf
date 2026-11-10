@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Wed, 11 Nov 2026 02:00:02 +0300
+Subject: [PATCH] Allow lock-free async getNearbyEntities
+
+Copyright (c) 2026 seven7sas (Fork Leaf - https://github.com/seven7sas/Leaf)
+SPDX-License-Identifier: GPL-3.0-only
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+index e4f13a7890d299fa9414e6462f032038ddd7587f..72171f4e0603f3583460da36e0ece3af363631a1 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+@@ -984,7 +984,6 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+ 
+     @Override
+     public Collection<Entity> getNearbyEntities(BoundingBox boundingBox, Predicate<? super Entity> filter) {
+-        org.spigotmc.AsyncCatcher.catchOp("getNearbyEntities"); // Spigot
+         Preconditions.checkArgument(boundingBox != null, "BoundingBox cannot be null");
+ 
+         AABB bb = new AABB(boundingBox.getMinX(), boundingBox.getMinY(), boundingBox.getMinZ(), boundingBox.getMaxX(), boundingBox.getMaxY(), boundingBox.getMaxZ());
+@@ -992,6 +991,7 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+         List<Entity> bukkitEntityList = new ArrayList<org.bukkit.entity.Entity>(entityList.size());
+ 
+         for (net.minecraft.world.entity.Entity entity : entityList) {
++            if (entity == null) continue; // Leaf - Async getNearbyEntities null guard
+             Entity bukkitEntity = entity.getBukkitEntity();
+             if (filter == null || filter.test(bukkitEntity)) {
+                 bukkitEntityList.add(bukkitEntity);
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index df7385f04652afdd9156575ac47d886eefb49bd2..ec35503255d377ecbdccbb6efdc56c1a68cf454b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -394,12 +394,12 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+     @Override
+     public List<org.bukkit.entity.Entity> getNearbyEntities(double x, double y, double z) {
+         Preconditions.checkState(!this.entity.generation, "Cannot get nearby entities during world generation");
+-        org.spigotmc.AsyncCatcher.catchOp("getNearbyEntities"); // Spigot
+ 
+         List<Entity> entities = this.getHandle().level().getEntities(this.entity, this.entity.getBoundingBox().inflate(x, y, z), Predicates.alwaysTrue());
+         List<org.bukkit.entity.Entity> result = new java.util.ArrayList<>(entities.size());
+ 
+         for (Entity entity : entities) {
++            if (entity == null) continue; // Leaf - Async getNearbyEntities null guard
+             result.add(entity.getBukkitEntity());
+         }
+         return result;
