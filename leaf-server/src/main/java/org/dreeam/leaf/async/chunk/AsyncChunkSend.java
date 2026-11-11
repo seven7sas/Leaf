@@ -24,4 +24,10 @@ public final class AsyncChunkSend {
 
     private AsyncChunkSend() {
     }
+
+    public static void shutdownNow() {
+        if (!POOL.isShutdown()) {
+            POOL.shutdownNow();
+        }
+    }
 }

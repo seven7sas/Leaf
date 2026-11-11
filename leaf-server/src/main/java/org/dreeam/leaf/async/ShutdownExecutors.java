@@ -50,9 +50,11 @@ public class ShutdownExecutors {
             }
         }
 
-        if (org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL != null) {
-            LOGGER.info("Waiting for async chunk sender pool to shutdown...");
-            org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.shutdown();
+        if (org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL != null && !org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.isTerminated()) {
+            if (!org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.isShutdown()) {
+                LOGGER.info("Waiting for async chunk sender pool to shutdown...");
+                org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.shutdown();
+            }
             try {
                 org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.awaitTermination(10L, TimeUnit.SECONDS);
             } catch (InterruptedException ignored) {

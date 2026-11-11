@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Thu, 12 Nov 2026 00:22:02 +0300
+Subject: [PATCH] Spawn chunk warmup, instant 3x3 chunk send and parallel
+ region shutdown
+
+Copyright (c) 2026 seven7sas (Fork Leaf - https://github.com/seven7sas/Leaf)
+
+SPDX-License-Identifier: GPL-3.0-only
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index 1797e1d57a3f9d4fb55f0c6a9c7df3f9c61d59bf..2fad390a0fdd146108586c45f81ff78b0f4e1263 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -703,6 +703,10 @@ public final class RegionizedPlayerChunkLoader {
+         }
+ 
+         void updateQueues(final long time) {
++            this.updateQueues(time, true);
++        }
++
++        private void updateQueues(final long time, final boolean allowInitialLoadBurst) {
+             TickThread.ensureTickThread(this.player, "Cannot tick player chunk loader async");
+             if (this.removed) {
+                 throw new IllegalStateException("Ticking removed player chunk loader");
+@@ -745,7 +749,10 @@ public final class RegionizedPlayerChunkLoader {
+             final long rampLoadCap = this.rampingUp ? (16L + (long)this.rampTickCount * 12L) : MAX_RATE;
+             final long maxLoads = Math.max(0L, Math.min(rampLoadCap, Math.min(MAX_RATE, Math.min(this.loadQueue.size(), this.getMaxChunkLoads()))));
+             // Leaf end
+-            final int maxLoadsThisTick = (int)this.chunkLoadTicketLimiter.takeAllocation(time, loadRate, maxLoads);
++            int maxLoadsThisTick = (int)this.chunkLoadTicketLimiter.takeAllocation(time, loadRate, maxLoads);
++            if (allowInitialLoadBurst && ((this.rampingUp && this.rampTickCount == 0) || (!this.rampingUp && this.sentChunks.isEmpty()))) {
++                maxLoadsThisTick = Math.max(maxLoadsThisTick, Math.min(25, this.loadQueue.size()));
++            }
+             if (maxLoadsThisTick > 0) {
+                 final LongArrayList chunks = new LongArrayList(maxLoadsThisTick);
+                 for (int i = 0; i < maxLoadsThisTick; ++i) {
+@@ -906,6 +913,11 @@ public final class RegionizedPlayerChunkLoader {
+                 if (maxSendsThisTick > rampSendCap) {
+                     maxSendsThisTick = rampSendCap;
+                 }
++                if (this.rampTickCount == 0) {
++                    maxSendsThisTick = Math.max(maxSendsThisTick, Math.min(9, this.sendQueue.size()));
++                }
++            } else if (this.sentChunks.size() < 9) {
++                maxSendsThisTick = Math.max(maxSendsThisTick, Math.min(9 - this.sentChunks.size(), this.sendQueue.size()));
+             }
+             // Leaf end
+             // we do not return sends that we took from the allocation back because we want to limit the max send rate, not target it
+@@ -931,7 +943,10 @@ public final class RegionizedPlayerChunkLoader {
+ 
+                 // Leaf start - async chunk sender
+                 if (this.asyncSender != null) {
+-                    if (this.leaf$sendChunk(pendingSendX, pendingSendZ)) {
++                    if (this.sentChunks.size() < 9 && Math.max(Math.abs(pendingSendX - this.lastChunkX), Math.abs(pendingSendZ - this.lastChunkZ)) <= 1) {
++                        this.sendQueue.dequeueLong();
++                        this.sendChunk(pendingSendX, pendingSendZ);
++                    } else if (this.leaf$sendChunk(pendingSendX, pendingSendZ)) {
+                         this.sendQueue.dequeueLong();
+                     } else {
+                         break;
+@@ -1011,6 +1026,16 @@ public final class RegionizedPlayerChunkLoader {
+ 
+             // now we can update
+             this.update();
++            if (!this.removed) {
++                final long queueTime = System.nanoTime();
++                this.updateQueues(queueTime, true);
++                if (!this.removed && this.sentChunks.size() < 9 && (!this.loadingQueue.isEmpty() || !this.genQueue.isEmpty() || !this.generatingQueue.isEmpty())) {
++                    this.updateQueues(queueTime, false);
++                    if (!this.removed && this.sentChunks.size() < 9 && (!this.generatingQueue.isEmpty() || !this.sendQueue.isEmpty())) {
++                        this.updateQueues(queueTime, false);
++                    }
++                }
++            }
+         }
+ 
+         private boolean isLoadedChunkGeneratable(final int chunkX, final int chunkZ) {
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index cc031f1508d1092137e94d155cd840c5db42e117..70082db5d6f56cbe2b87085157aee997d8347d37 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1112,6 +1112,10 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             try { Thread.sleep(100); } catch (InterruptedException ex) {} // CraftBukkit - SPIGOT-625 - give server at least a chance to send packets
+         }
+ 
++        // Leaf start - Cancel pending async chunk packet encoding once all players disconnected before world saving
++        org.dreeam.leaf.async.chunk.AsyncChunkSend.shutdownNow();
++        // Leaf end
++
+         LOGGER.info("Saving worlds");
+ 
+         for (ServerLevel serverLevel : this.getAllLevels()) {
+diff --git a/net/minecraft/world/level/chunk/storage/RegionFileStorage.java b/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
+index 825b7326cb22c85e8d766f36eea9dd2a2cbb0673..2608417458c2a78fcf438b6a21a1f6353c29b876 100644
+--- a/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
++++ b/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
+@@ -444,19 +444,62 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+         }
+     }
+ 
+-    @Override
+-    public void close() throws IOException {
+-        // Paper start - rewrite chunk system
+-        synchronized (this) {
+-            final ExceptionCollector<IOException> exceptionCollector = new ExceptionCollector<>();
++    @FunctionalInterface
++    private interface RegionFileAction {
++        void run(abomination.IRegionFile regionFile) throws IOException;
++    }
++
++    private void runOnRegionFiles(final RegionFileAction action) throws IOException {
++        final ExceptionCollector<IOException> exceptionCollector = new ExceptionCollector<>();
++        final int size = this.regionCache.size();
++        if (size <= 1) {
+             for (final abomination.IRegionFile regionFile : this.regionCache.values()) { // Luminol - Configurable region file format
+                 try {
+-                    regionFile.close();
++                    action.run(regionFile);
+                 } catch (final IOException ex) {
+                     exceptionCollector.add(ex);
+                 }
+             }
+-            exceptionCollector.throwIfPresent();
++        } else {
++            // Leaf start - Bounded-worker parallel region file flush/close on I/O pool (bounds native Zstd contexts)
++            final abomination.IRegionFile[] files = this.regionCache.values().toArray(new abomination.IRegionFile[0]);
++            final int workers = Math.min(files.length, Math.clamp(Runtime.getRuntime().availableProcessors() / 2, 2, 4));
++            final java.util.concurrent.atomic.AtomicInteger index = new java.util.concurrent.atomic.AtomicInteger();
++            final java.util.concurrent.ConcurrentLinkedQueue<IOException> asyncExceptions = new java.util.concurrent.ConcurrentLinkedQueue<>();
++            final java.util.List<java.util.concurrent.CompletableFuture<Void>> futures = new java.util.ArrayList<>(workers);
++            final Runnable workerTask = () -> {
++                int i;
++                while ((i = index.getAndIncrement()) < files.length) {
++                    try {
++                        action.run(files[i]);
++                    } catch (final IOException ex) {
++                        asyncExceptions.add(ex);
++                    }
++                }
++            };
++            for (int w = 0; w < workers; w++) {
++                try {
++                    futures.add(java.util.concurrent.CompletableFuture.runAsync(workerTask, net.minecraft.util.Util.ioPool()));
++                } catch (final java.util.concurrent.RejectedExecutionException rejected) {
++                    workerTask.run();
++                }
++            }
++            if (!futures.isEmpty()) {
++                java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0])).join();
++            }
++            for (final IOException ex : asyncExceptions) {
++                exceptionCollector.add(ex);
++            }
++            // Leaf end
++        }
++        exceptionCollector.throwIfPresent();
++    }
++
++    @Override
++    public void close() throws IOException {
++        // Paper start - rewrite chunk system
++        synchronized (this) {
++            this.runOnRegionFiles(abomination.IRegionFile::close);
+         }
+         // Paper end - rewrite chunk system
+     }
+@@ -464,16 +507,7 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+     public void flush() throws IOException {
+         // Paper start - rewrite chunk system
+         synchronized (this) {
+-            final ExceptionCollector<IOException> exceptionCollector = new ExceptionCollector<>();
+-            for (final abomination.IRegionFile regionFile : this.regionCache.values()) { // Luminol - Configurable region file format
+-                try {
+-                    regionFile.flush();
+-                } catch (final IOException ex) {
+-                    exceptionCollector.add(ex);
+-                }
+-            }
+-
+-            exceptionCollector.throwIfPresent();
++            this.runOnRegionFiles(abomination.IRegionFile::flush);
+         }
+         // Paper end - rewrite chunk system
+     }
+diff --git a/net/minecraft/world/level/storage/PlayerDataStorage.java b/net/minecraft/world/level/storage/PlayerDataStorage.java
+index 9571e93842abc94036a1c1868844ee89e1040098..6ca8db9be571df9a64a7ec94cdccd883535db81f 100644
+--- a/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -184,6 +184,9 @@ public class PlayerDataStorage {
+                 && (server == null || server.getPlayerList().getPlayer(uuid) == null)) {
+                 PRELOADED_TIMESTAMPS.put(uuid, System.currentTimeMillis());
+                 PRELOADED_PLAYER_DATA.put(uuid, loaded);
++                if (server != null && !server.hasStopped()) {
++                    scheduleSpawnChunkWarmup(server, uuid, loaded);
++                }
+             }
+             return loaded;
+         }, executor);
+@@ -195,6 +198,119 @@ public class PlayerDataStorage {
+         future.whenComplete((res, ex) -> PRELOAD_FUTURES.remove(uuid, future));
+     }
+ 
++    private static void scheduleSpawnChunkWarmup(
++        final net.minecraft.server.MinecraftServer server,
++        final java.util.UUID uuid,
++        final Optional<CompoundTag> loaded
++    ) {
++        Long worldUuidMost = null;
++        Long worldUuidLeast = null;
++        String worldName = null;
++        String dimensionStr = null;
++        Integer posChunkX = null;
++        Integer posChunkZ = null;
++
++        if (loaded.isPresent()) {
++            final CompoundTag tag = loaded.get();
++            final Optional<Long> most = tag.getLong("WorldUUIDMost");
++            final Optional<Long> least = tag.getLong("WorldUUIDLeast");
++            if (most.isPresent() && least.isPresent()) {
++                worldUuidMost = most.get();
++                worldUuidLeast = least.get();
++            } else {
++                worldName = tag.getString("world").orElse(null);
++            }
++            dimensionStr = tag.getString("Dimension").orElse(null);
++
++            final Optional<net.minecraft.nbt.ListTag> posOpt = tag.getList("Pos");
++            if (posOpt.isPresent()) {
++                final net.minecraft.nbt.ListTag posList = posOpt.get();
++                if (posList.size() >= 3) {
++                    final Optional<Double> xOpt = posList.getDouble(0);
++                    final Optional<Double> zOpt = posList.getDouble(2);
++                    if (xOpt.isPresent() && zOpt.isPresent()) {
++                        final double x = xOpt.get();
++                        final double z = zOpt.get();
++                        if (Double.isFinite(x) && Double.isFinite(z)) {
++                            posChunkX = net.minecraft.util.Mth.floor(x) >> 4;
++                            posChunkZ = net.minecraft.util.Mth.floor(z) >> 4;
++                        }
++                    }
++                }
++            }
++        }
++
++        final Long finalWorldUuidMost = worldUuidMost;
++        final Long finalWorldUuidLeast = worldUuidLeast;
++        final String finalWorldName = worldName;
++        final String finalDimensionStr = dimensionStr;
++        final Integer finalPosChunkX = posChunkX;
++        final Integer finalPosChunkZ = posChunkZ;
++
++        server.execute(() -> {
++            if (server.hasStopped() || server.getPlayerList().getPlayer(uuid) != null) {
++                return;
++            }
++
++            net.minecraft.server.level.ServerLevel targetLevel = null;
++            if (finalWorldUuidMost != null && finalWorldUuidLeast != null) {
++                final org.bukkit.World bWorld = org.bukkit.Bukkit.getServer().getWorld(new java.util.UUID(finalWorldUuidMost, finalWorldUuidLeast));
++                if (bWorld instanceof org.bukkit.craftbukkit.CraftWorld craftWorld) {
++                    targetLevel = craftWorld.getHandle();
++                }
++            } else if (finalWorldName != null) {
++                final org.bukkit.World bWorld = org.bukkit.Bukkit.getServer().getWorld(finalWorldName);
++                if (bWorld instanceof org.bukkit.craftbukkit.CraftWorld craftWorld) {
++                    targetLevel = craftWorld.getHandle();
++                }
++            } else if (finalDimensionStr != null) {
++                final net.minecraft.resources.Identifier dimId = net.minecraft.resources.Identifier.tryParse(finalDimensionStr);
++                if (dimId != null) {
++                    final net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimKey =
++                        net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION, dimId);
++                    targetLevel = server.getLevel(dimKey);
++                }
++            }
++
++            final LevelData.RespawnData respawnData = server.getWorldData().overworldData().getRespawnData();
++            if (targetLevel == null) {
++                targetLevel = server.getLevel(respawnData.dimension());
++                if (targetLevel == null) {
++                    targetLevel = server.overworld();
++                }
++            }
++            if (targetLevel == null) {
++                return;
++            }
++
++            final net.minecraft.core.BlockPos respawnPos = respawnData.pos();
++            final int warmupChunkX = finalPosChunkX != null ? finalPosChunkX : net.minecraft.core.SectionPos.blockToSectionCoord(respawnPos.getX());
++            final int warmupChunkZ = finalPosChunkZ != null ? finalPosChunkZ : net.minecraft.core.SectionPos.blockToSectionCoord(respawnPos.getZ());
++
++            final net.minecraft.server.level.ServerLevel warmupLevel = targetLevel;
++            warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
++                if (server.hasStopped() || server.getPlayerList().getPlayer(uuid) != null) {
++                    return;
++                }
++                ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel) warmupLevel).moonrise$loadChunksAsync(
++                    warmupChunkX - 1, warmupChunkX + 1,
++                    warmupChunkZ - 1, warmupChunkZ + 1,
++                    net.minecraft.world.level.chunk.status.ChunkStatus.FULL,
++                    ca.spottedleaf.concurrentutil.util.Priority.HIGHER,
++                    chunks -> warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
++                        if (!server.hasStopped()) {
++                            warmupLevel.getChunkSource().addTicketWithRadius(
++                                net.minecraft.server.level.TicketType.PLAYER_SPAWN,
++                                new net.minecraft.world.level.ChunkPos(warmupChunkX, warmupChunkZ),
++                                1
++                            );
++                        }
++                    })
++                );
++            });
++        });
++    }
++
+     private Optional<CompoundTag> loadFromDisk(NameAndId nameAndId) {
+         Optional<CompoundTag> optional = this.load(nameAndId, ".dat");
+         if (optional.isEmpty()) {
