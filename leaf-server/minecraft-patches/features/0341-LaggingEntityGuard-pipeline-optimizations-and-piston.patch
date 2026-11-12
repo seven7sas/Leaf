@@ -1,0 +1,2236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Thu, 12 Nov 2026 04:01:05 +0300
+Subject: [PATCH] LaggingEntityGuard, pipeline optimizations and piston,
+ waypoint and leveldata fixes
+
+- LaggingEntityGuard hooks with ThreadMXBean CPU verification and GC guard in ServerLevel and Entity
+
+- Block/tick & entity physics pipelines: O(1) navigation/POI early-return, Alternate Current pooling + empty BlockRedstoneEvent skip, per-chunk scheduled tick cap, section fluid/inside-block/hard-collision fast paths and Cobweb/FallingBlockEntity optimizations
+
+- Piston entity section pre-check and empty BlockPistonEvent skip, Guava-free ServerWaypointManager with block coordinate caches, cached WorldGenSettings NBT tag and async level.dat compression
+
+Copyright (c) 2026 seven7sas (Fork Leaf - https://github.com/seven7sas/Leaf)
+
+SPDX-License-Identifier: GPL-3.0-only
+
+diff --git a/alternate/current/wire/LevelHelper.java b/alternate/current/wire/LevelHelper.java
+index ff663d3089627e75221aa128aff4bf5cc459addb..893fc279e1954437572f9cbae001b75e809fa7b0 100644
+--- a/alternate/current/wire/LevelHelper.java
++++ b/alternate/current/wire/LevelHelper.java
+@@ -14,6 +14,9 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
+ class LevelHelper {
+ 
+     static int doRedstoneEvent(ServerLevel level, BlockPos pos, int prevPower, int newPower) {
++        if (!org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++            return newPower;
++        }
+         BlockRedstoneEvent event = new BlockRedstoneEvent(CraftBlock.at(level, pos), prevPower, newPower);
+         level.getCraftServer().getPluginManager().callEvent(event);
+ 
+diff --git a/alternate/current/wire/WireConnection.java b/alternate/current/wire/WireConnection.java
+index 4fd8cb29024330397cfe4cbc1f237d285bfb7b3e..d7fc01db3e62c327bef68e17c41f1301cc4a00d8 100644
+--- a/alternate/current/wire/WireConnection.java
++++ b/alternate/current/wire/WireConnection.java
+@@ -10,13 +10,13 @@ package alternate.current.wire;
+ public class WireConnection {
+ 
+     /** The connected wire. */
+-    final WireNode wire;
++    WireNode wire;
+     /** Cardinal direction to the connected wire. */
+-    final int iDir;
++    int iDir;
+     /** True if the owner of the connection can provide power to the connected wire. */
+-    final boolean offer;
++    boolean offer;
+     /** True if the connected wire can provide power to the owner of the connection. */
+-    final boolean accept;
++    boolean accept;
+ 
+     /** The next connection in the sequence. */
+     WireConnection next;
+@@ -27,4 +27,13 @@ public class WireConnection {
+         this.offer = offer;
+         this.accept = accept;
+     }
++
++    WireConnection set(WireNode wire, int iDir, boolean offer, boolean accept) {
++        this.wire = wire;
++        this.iDir = iDir;
++        this.offer = offer;
++        this.accept = accept;
++        this.next = null;
++        return this;
++    }
+ }
+diff --git a/alternate/current/wire/WireConnectionManager.java b/alternate/current/wire/WireConnectionManager.java
+index f03b313e58385d626490a9e64c9616fd08aa951e..e85ed013ca37f055fd980a85fdf09376a64851ed 100644
+--- a/alternate/current/wire/WireConnectionManager.java
++++ b/alternate/current/wire/WireConnectionManager.java
+@@ -10,6 +10,7 @@ public class WireConnectionManager {
+ 
+     /** The owner of these connections. */
+     final WireNode owner;
++    private final WireHandler handler;
+ 
+     /** The first connection for each cardinal direction. */
+     private final WireConnection[] heads;
+@@ -28,8 +29,9 @@ public class WireConnectionManager {
+     /** The direction of flow based connections to other wires. */
+     int iFlowDir;
+ 
+-    WireConnectionManager(WireNode owner) {
++    WireConnectionManager(WireNode owner, WireHandler handler) {
+         this.owner = owner;
++        this.handler = handler;
+ 
+         this.heads = new WireConnection[Directions.HORIZONTAL.length];
+ 
+@@ -77,7 +79,13 @@ public class WireConnectionManager {
+         }
+     }
+ 
+-    private void clear() {
++    void clear() {
++        WireConnection c = head;
++        while (c != null) {
++            WireConnection next = c.next;
++            handler.recycleConnection(c);
++            c = next;
++        }
+         Arrays.fill(heads, null);
+ 
+         head = null;
+@@ -90,7 +98,7 @@ public class WireConnectionManager {
+     }
+ 
+     private void add(WireNode wire, int iDir, boolean offer, boolean accept) {
+-        add(new WireConnection(wire, iDir, offer, accept));
++        add(handler.obtainConnection(wire, iDir, offer, accept));
+     }
+ 
+     private void add(WireConnection connection) {
+diff --git a/alternate/current/wire/WireHandler.java b/alternate/current/wire/WireHandler.java
+index 2c3dcd7e21f5e79ec12c9ffff3cd3c7f9da28b73..4c1e74afd6a057eb86d99a9aae9a343c2baf262b 100644
+--- a/alternate/current/wire/WireHandler.java
++++ b/alternate/current/wire/WireHandler.java
+@@ -250,6 +250,11 @@ public class WireHandler {
+     // a cache of nodes that can be re-used.
+     private Node[] nodeCache;
+     private int nodeCount;
++    private WireNode[] wireNodeCache;
++    private int wireNodeCount;
++    private WireConnection freeConnectionHead;
++    private int freeConnectionCount;
++    private static final int MAX_POOLED_CONNECTIONS = 4096;
+ 
+     /** Is this WireHandler currently working through the update queue? */
+     private boolean updating;
+@@ -267,6 +272,8 @@ public class WireHandler {
+ 
+         this.nodeCache = new Node[16];
+         this.fillNodeCache(0, 16);
++        this.wireNodeCache = new WireNode[16];
++        this.fillWireNodeCache(0, 16);
+     }
+ 
+     private Node getOrAddNode(BlockPos pos) {
+@@ -309,7 +316,48 @@ public class WireHandler {
+      * cache and update it.
+      */
+     private Node getNextNode(BlockPos pos, BlockState state) {
+-        return state.is(Blocks.REDSTONE_WIRE) ? new WireNode(level, pos, state) : getNextNode().set(pos, state, true);
++        return state.is(Blocks.REDSTONE_WIRE) ? getNextWireNode(pos, state) : getNextNode().set(pos, state, true);
++    }
++
++    private WireNode getNextWireNode(BlockPos pos, BlockState state) {
++        if (wireNodeCount == wireNodeCache.length) {
++            increaseWireNodeCache();
++        }
++        return wireNodeCache[wireNodeCount++].setWire(pos, state);
++    }
++
++    private void increaseWireNodeCache() {
++        WireNode[] oldCache = wireNodeCache;
++        wireNodeCache = new WireNode[oldCache.length << 1];
++        System.arraycopy(oldCache, 0, wireNodeCache, 0, oldCache.length);
++        fillWireNodeCache(oldCache.length, wireNodeCache.length);
++    }
++
++    private void fillWireNodeCache(int start, int end) {
++        for (int index = start; index < end; index++) {
++            wireNodeCache[index] = new WireNode(level, this);
++        }
++    }
++
++    WireConnection obtainConnection(WireNode wire, int iDir, boolean offer, boolean accept) {
++        WireConnection connection = this.freeConnectionHead;
++        if (connection != null) {
++            this.freeConnectionHead = connection.next;
++            this.freeConnectionCount--;
++            return connection.set(wire, iDir, offer, accept);
++        }
++        return new WireConnection(wire, iDir, offer, accept);
++    }
++
++    void recycleConnection(WireConnection connection) {
++        connection.wire = null;
++        if (this.freeConnectionCount < MAX_POOLED_CONNECTIONS) {
++            connection.next = this.freeConnectionHead;
++            this.freeConnectionHead = connection;
++            this.freeConnectionCount++;
++        } else {
++            connection.next = null;
++        }
+     }
+ 
+     /**
+@@ -452,7 +500,7 @@ public class WireHandler {
+         WireNode wire;
+ 
+         if (node == null || !node.isWire()) {
+-            wire = new WireNode(level, pos, state);
++            wire = getNextWireNode(pos, state);
+         } else {
+             wire = node.asWire();
+         }
+@@ -781,12 +829,28 @@ public class WireHandler {
+     }
+ 
+     private void tryUpdate() {
+-        if (!search.isEmpty()) {
+-            update();
+-        }
+-        if (!updating) {
+-            nodes.clear();
+-            nodeCount = 0;
++        try {
++            if (!search.isEmpty()) {
++                update();
++            }
++        } finally {
++            if (!updating) {
++                for (int i = 0; i < wireNodeCount; i++) {
++                    wireNodeCache[i].clearForPool();
++                }
++                wireNodeCount = 0;
++                for (int i = 0; i < nodeCount; i++) {
++                    Node node = nodeCache[i];
++                    java.util.Arrays.fill(node.neighbors, null);
++                    node.pos = null;
++                    node.state = null;
++                    node.neighborWire = null;
++                    node.prev_node = null;
++                    node.next_node = null;
++                }
++                nodes.clear();
++                nodeCount = 0;
++            }
+         }
+     }
+ 
+diff --git a/alternate/current/wire/WireNode.java b/alternate/current/wire/WireNode.java
+index 298076a0db4e6ee6e4775ac43bf749d9f5689bdb..1ac6cff7f5f19171438a98456333f7d20044eb96 100644
+--- a/alternate/current/wire/WireNode.java
++++ b/alternate/current/wire/WireNode.java
+@@ -46,16 +46,51 @@ public class WireNode extends Node {
+     /** The next wire in the simple queue. */
+     WireNode next_wire;
+ 
+-    WireNode(ServerLevel level, BlockPos pos, BlockState state) {
++    WireNode(ServerLevel level, WireHandler handler) {
+         super(level);
++        this.connections = new WireConnectionManager(this, handler);
++    }
++
++    WireNode setWire(BlockPos pos, BlockState state) {
++        if (this.connections.total > 0) {
++            this.connections.clear();
++        }
++        java.util.Arrays.fill(this.neighbors, null);
+ 
+         this.pos = pos.immutable();
+         this.state = state;
+-
+-        this.connections = new WireConnectionManager(this);
++        this.invalid = false;
++        this.prev_node = null;
++        this.next_node = null;
++        this.neighborWire = null;
++        this.next_wire = null;
+ 
+         this.virtualPower = this.currentPower = this.state.getValue(RedStoneWireBlock.POWER);
+         this.priority = priority();
++        this.externalPower = 0;
++        this.flowIn = 0;
++        this.iFlowDir = 0;
++        this.added = false;
++        this.removed = false;
++        this.shouldBreak = false;
++        this.root = false;
++        this.discovered = false;
++        this.searched = false;
++
++        return this;
++    }
++
++    void clearForPool() {
++        if (this.connections.total > 0) {
++            this.connections.clear();
++        }
++        java.util.Arrays.fill(this.neighbors, null);
++        this.pos = null;
++        this.state = null;
++        this.prev_node = null;
++        this.next_node = null;
++        this.neighborWire = null;
++        this.next_wire = null;
+     }
+ 
+     @Override
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+index f71dea9e3f46ea62ab604ccba5f9661a1f0cd766..a303edf6fb5d6408ea02bb030fa798a251d368d8 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+@@ -217,6 +217,20 @@ public final class ChunkEntitySlices {
+         return this.entities.size() == 0;
+     }
+ 
++    public int getEntityCount() {
++        return this.entities.size();
++    }
++
++    public boolean hasEntitiesInSection(final int sectionY) {
++        if (this.allEntities.count == 0) {
++            return false;
++        }
++        final int sectionIndex = sectionY - this.minSection;
++        return sectionIndex >= 0
++            && sectionIndex < this.allEntities.entitiesBySection.length
++            && this.allEntities.entitiesBySection[sectionIndex] != null;
++    }
++
+     public void mergeInto(final ChunkEntitySlices slices) {
+         final Entity[] entities = this.entities.getRawData();
+         for (int i = 0, size = Math.min(entities.length, this.entities.size()); i < size; ++i) {
+@@ -319,6 +333,39 @@ public final class ChunkEntitySlices {
+         return true;
+     }
+ 
++    public boolean hasHardCollidingEntities() {
++        return this.hardCollidingEntities.count != 0;
++    }
++
++    public boolean exceedsSameCellEntityLimit(final Entity self, final EntityType<?> type, final int blockX, final int blockY, final int blockZ, final double maxSpeedSqr, final int limit) {
++        final EntityCollectionBySection byType = this.entitiesByType.get(type);
++        if (byType == null || byType.count <= limit) {
++            return false;
++        }
++        final int sectionIndex = (blockY >> 4) - this.minSection;
++        if (sectionIndex < 0 || sectionIndex >= byType.entitiesBySection.length) {
++            return false;
++        }
++        final BasicEntityList<Entity> list = byType.entitiesBySection[sectionIndex];
++        if (list == null || list.size() <= limit) {
++            return false;
++        }
++        final Entity[] storage = list.storage;
++        final int len = Math.min(list.size(), storage.length);
++        int count = 0;
++        for (int i = 0; i < len; ++i) {
++            final Entity other = storage[i];
++            if (other != null && other != self && !other.isRemoved()
++                && other.getBlockX() == blockX && other.getBlockY() == blockY && other.getBlockZ() == blockZ
++                && other.getDeltaMovement().lengthSqr() < maxSpeedSqr) {
++                if (++count >= limit) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
+     public void getHardCollidingEntities(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
+         this.hardCollidingEntities.getEntities(except, box, into, predicate);
+     }
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index c1d24cff2af534edfb9fcc45f3cf2b31eb04c6de..6a7b76234b736681f20fda5e08c857e43492e2e2 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -52,6 +52,11 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+     protected final ConcurrentHashMap<UUID, Entity> entityByUUID = new ConcurrentHashMap<>();
+     protected final EntityList accessibleEntities = new EntityList();
+     public final it.unimi.dsi.fastutil.objects.ReferenceArrayList<Entity> weakEntityList = new it.unimi.dsi.fastutil.objects.ReferenceArrayList<>(); // Leaf - Rewrite entity despawn time
++    private int hardCollidingEntityCount; // Leaf - Fast empty hard-colliding entity skip
++
++    public boolean hasHardCollidingEntities() {
++        return this.hardCollidingEntityCount != 0;
++    }
+ 
+     public EntityLookup(final Level world, final LevelCallback<Entity> worldCallback) {
+         this.world = world;
+@@ -471,6 +476,8 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         final ChunkEntitySlices slices = this.getOrCreateChunk(sectionX, sectionZ);
+         if (!slices.addEntity(entity, sectionY)) {
+             LOGGER.warn("Entity " + entity + " added to world '" + WorldUtil.getWorldName(this.world) + "', but was already contained in entity chunk (" + sectionX + "," + sectionZ + ")");
++        } else if (((ChunkSystemEntity)entity).moonrise$isHardColliding()) {
++            ++this.hardCollidingEntityCount;
+         }
+ 
+         entity.setLevelCallback(new EntityCallback(entity));
+@@ -511,6 +518,8 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+             }
+             if (!slices.removeEntity(entity, sectionY)) {
+                 LOGGER.warn("Failed to remove entity " + entity + " from entity slices (" + sectionX + "," + sectionZ + ")");
++            } else if (((ChunkSystemEntity)entity).moonrise$isHardColliding()) {
++                --this.hardCollidingEntityCount;
+             }
+         }
+         if (org.dreeam.leaf.config.modules.opt.DespawnTime.proactiveWeakLoading) entity.leaf$isWeakLoaded = false; // Leaf - Rewrite entity despawn time
+@@ -634,6 +643,9 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+     }
+ 
+     public void getHardCollidingEntities(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
++        if (this.hardCollidingEntityCount == 0) {
++            return;
++        }
+         final int minChunkX = (Mth.floor(box.minX) - 2) >> 4;
+         final int minChunkZ = (Mth.floor(box.minZ) - 2) >> 4;
+         final int maxChunkX = (Mth.floor(box.maxX) + 2) >> 4;
+@@ -661,7 +673,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+                 for (int currZ = minZ; currZ <= maxZ; ++currZ) {
+                     for (int currX = minX; currX <= maxX; ++currX) {
+                         final ChunkEntitySlices chunk = region.get(currX | (currZ << REGION_SHIFT));
+-                        if (chunk == null || !chunk.status.isOrAfter(FullChunkStatus.FULL)) {
++                        if (chunk == null || !chunk.status.isOrAfter(FullChunkStatus.FULL) || !chunk.hasHardCollidingEntities()) {
+                             continue;
+                         }
+ 
+diff --git a/io/papermc/paper/redstone/RedstoneWireTurbo.java b/io/papermc/paper/redstone/RedstoneWireTurbo.java
+index bdc5f13321362d5ecd99562b48f9950ad72bbfba..fcb449e9d4be90196c4350e3b61ced75bdc0ee65 100644
+--- a/io/papermc/paper/redstone/RedstoneWireTurbo.java
++++ b/io/papermc/paper/redstone/RedstoneWireTurbo.java
+@@ -899,7 +899,7 @@ public final class RedstoneWireTurbo {
+ 
+         // egg82's amendment
+         // Adding Bukkit's BlockRedstoneEvent - er.. event.
+-        if (i != j) {
++        if (i != j && org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
+             BlockRedstoneEvent event = new BlockRedstoneEvent(CraftBlock.at(worldIn, upd.self), i, j);
+             worldIn.getCraftServer().getPluginManager().callEvent(event);
+             j = event.getNewCurrent();
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 413bf551e01bada950e7224eadc80363821f6cf1..b7c32953f05d8ebebe2f39834a80ddf0d4b0c8ef 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -239,6 +239,34 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     final List<ServerPlayer> realPlayers; // Leaves - skip
+     public final org.dreeam.leaf.async.tracker.AsyncTracker leaf$asyncTracker = new org.dreeam.leaf.async.tracker.AsyncTracker(this); // Leaf - Multithreaded tracker
+     private @Nullable WorldBorder worldBorder; // Leaf - Cache world border
++    // Leaf start - LaggingEntityGuard per-world chunk timing tracking & CPU/GC verification
++    private static final int LEAF_LAGGING_CHUNK_MAX_MOBS = 16;
++    private static final java.lang.management.ThreadMXBean THREAD_MX = java.lang.management.ManagementFactory.getThreadMXBean();
++    private static final boolean LEAF_THREAD_CPU_TIME_SUPPORTED = leaf$initThreadCpuTimeSupport();
++    private static final List<java.lang.management.GarbageCollectorMXBean> LEAF_GC_BEANS = java.lang.management.ManagementFactory.getGarbageCollectorMXBeans();
++
++    private static boolean leaf$initThreadCpuTimeSupport() {
++        try {
++            return THREAD_MX != null && THREAD_MX.isThreadCpuTimeSupported() && THREAD_MX.isThreadCpuTimeEnabled();
++        } catch (final UnsupportedOperationException | SecurityException ignored) {
++            return false;
++        }
++    }
++
++    private static long leaf$totalGcCollections() {
++        long total = 0L;
++        for (int i = 0, len = LEAF_GC_BEANS.size(); i < len; i++) {
++            final long count = LEAF_GC_BEANS.get(i).getCollectionCount();
++            if (count > 0L) {
++                total += count;
++            }
++        }
++        return total;
++    }
++
++    private final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap leaf$chunkEntityTickNanos = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
++    private final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap leaf$chunkLagStrikes = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
++    // Leaf end - LaggingEntityGuard per-world chunk timing tracking & CPU/GC verification
+ 
+     @Override
+     public @Nullable LevelChunk getChunkIfLoaded(int x, int z) {
+@@ -1041,6 +1069,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             org.dreeam.leaf.async.collision.ParallelCollisionDispatcher.tick(this, this.entityTickList);
+             org.dreeam.leaf.async.ai.ParallelBrainSensingDispatcher.tick(this, this.entityTickList);
+             // Leaf end - Split-phase parallel collisions & off-thread brain sensing
++            final boolean leaf$lagGuardEnabled = org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.enabled; // Leaf - LaggingEntityGuard
++            final long leaf$gcCountBefore = leaf$lagGuardEnabled ? leaf$totalGcCollections() : 0L;
++            if (leaf$lagGuardEnabled && !this.leaf$chunkEntityTickNanos.isEmpty()) {
++                this.leaf$chunkEntityTickNanos.clear();
++            }
+             this.entityTickList
+                 .forEach(
+                     entity -> {
+@@ -1062,6 +1095,17 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+                                     profilerFiller.push("tick");
+                                     // Gale start - Airplane - remove lambda from ticking guard - copied from guardEntityTick
++                                    final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices leaf$slices =
++                                        leaf$lagGuardEnabled ? this.moonrise$getEntityLookup().getChunk(entity.chunkPosition().x, entity.chunkPosition().z) : null;
++                                    final boolean leaf$trackChunkLag = leaf$lagGuardEnabled && leaf$slices != null
++                                        && leaf$slices.getEntityCount() >= org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.minEntitiesInChunk;
++                                    if (!leaf$trackChunkLag && entity.leaf$lagStrikes != 0) {
++                                        entity.leaf$lagStrikes = 0;
++                                    }
++                                    final boolean leaf$measureCpu = leaf$trackChunkLag && LEAF_THREAD_CPU_TIME_SUPPORTED
++                                        && entity.leaf$lagStrikes >= org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.suspectStrikes;
++                                    final long leaf$entityStartNanos = leaf$trackChunkLag ? System.nanoTime() : 0L; // Leaf - LaggingEntityGuard
++                                    final long leaf$entityStartCpuNanos = leaf$measureCpu ? THREAD_MX.getCurrentThreadCpuTime() : 0L;
+                                     try {
+                                         this.tickNonPassenger(entity); // Gale - Airplane - remove lambda from ticking guard - changed
+                                     } catch (Throwable var6) {
+@@ -1072,6 +1116,48 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                                         entity.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DISCARD);
+                                         // Paper end - Prevent block entity and entity crashes
+                                     }
++                                    // Leaf start - LaggingEntityGuard two-stage watchdog (wall + ThreadMXBean CPU verification)
++                                    if (leaf$trackChunkLag) {
++                                        final long leaf$wallElapsed = System.nanoTime() - leaf$entityStartNanos;
++                                        final long leaf$cpuElapsed = leaf$measureCpu
++                                            ? Math.max(0L, THREAD_MX.getCurrentThreadCpuTime() - leaf$entityStartCpuNanos)
++                                            : -1L;
++                                        this.leaf$chunkEntityTickNanos.addTo(entity.chunkPosition().toLong(), leaf$wallElapsed);
++                                        if (!entity.isRemoved()) {
++                                            final long leaf$maxEntityNanos = org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.maxEntityTickNanos;
++                                            if (leaf$wallElapsed < leaf$maxEntityNanos || entity.leaf$isProtectedFromLagCull()) {
++                                                entity.leaf$lagStrikes = 0;
++                                            } else if (leaf$totalGcCollections() == leaf$gcCountBefore) {
++                                                final boolean leaf$cpuVerified = !leaf$measureCpu
++                                                    || (leaf$cpuElapsed > 0L
++                                                        && leaf$cpuElapsed >= (leaf$maxEntityNanos >> 1)
++                                                        && leaf$cpuElapsed >= (leaf$wallElapsed >> 1));
++                                                if (leaf$cpuVerified) {
++                                                    entity.leaf$lagStrikes++;
++                                                    if (entity.leaf$lagStrikes >= org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.requiredStrikes) {
++                                                        if (org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.logRemovals) {
++                                                            LOGGER.warn(
++                                                                "[LaggingEntityGuard] Removed lagging entity {} at {} ({}, {}, {}) taking {} ms wall ({} ms cpu) across {} ticks",
++                                                                BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()),
++                                                                this.getWorld().getName(),
++                                                                entity.getBlockX(), entity.getBlockY(), entity.getBlockZ(),
++                                                                String.format(Locale.ROOT, "%.2f", leaf$wallElapsed / 1_000_000.0),
++                                                                leaf$cpuElapsed >= 0L ? String.format(Locale.ROOT, "%.2f", leaf$cpuElapsed / 1_000_000.0) : "n/a",
++                                                                entity.leaf$lagStrikes
++                                                            );
++                                                        }
++                                                        entity.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DISCARD);
++                                                        if (!org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) {
++                                                            this.moonrise$midTickTasks();
++                                                        }
++                                                        profilerFiller.pop();
++                                                        return;
++                                                    }
++                                                }
++                                            }
++                                        }
++                                    }
++                                    // Leaf end - LaggingEntityGuard two-stage watchdog
+                                     if (!org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) // Leaf - SparklyPaper - parallel world ticking (only run mid-tick at the end of each tick / fixes concurrency bugs related to executeMidTickTasks)
+                                     this.moonrise$midTickTasks(); // Paper - rewrite chunk system
+                                     // Gale end - Airplane - remove lambda from ticking guard - copied from guardEntityTick
+@@ -1081,6 +1167,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                         }
+                     }
+                 );
++            if (leaf$lagGuardEnabled) { // Leaf - LaggingEntityGuard chunk lag machine detection
++                this.leaf$updateChunkLagStrikes(leaf$totalGcCollections() != leaf$gcCountBefore);
++            } else if (!this.leaf$chunkLagStrikes.isEmpty()) {
++                this.leaf$chunkLagStrikes.clear();
++            }
+             if (this.paperConfig().unsupportedSettings.ticking.blockEntities) { // Paper - option to disable ticking
+             profilerFiller.popPush("blockEntities");
+             this.tickBlockEntities();
+@@ -1675,6 +1766,129 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         }
+     }
+ 
++    // Leaf start - LaggingEntityGuard chunk lag machine watchdog & priority culling
++    private void leaf$updateChunkLagStrikes(final boolean gcOccurredThisTick) {
++        if (gcOccurredThisTick) {
++            return;
++        }
++
++        final long maxChunkNanos = org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.maxChunkEntityTickNanos;
++        final int minEntities = org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.minEntitiesInChunk;
++        final int requiredChunkStrikes = org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.requiredChunkStrikes;
++
++        if (!this.leaf$chunkLagStrikes.isEmpty()) {
++            final var strikeIterator = this.leaf$chunkLagStrikes.long2IntEntrySet().fastIterator();
++            while (strikeIterator.hasNext()) {
++                final var entry = strikeIterator.next();
++                final long chunkKey = entry.getLongKey();
++                if (this.leaf$chunkEntityTickNanos.get(chunkKey) < maxChunkNanos) {
++                    strikeIterator.remove();
++                    continue;
++                }
++                final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices slices =
++                    this.moonrise$getEntityLookup().getChunk(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
++                if (slices == null || slices.getEntityCount() < minEntities) {
++                    strikeIterator.remove();
++                }
++            }
++        }
++
++        if (this.leaf$chunkEntityTickNanos.isEmpty()) {
++            return;
++        }
++
++        final var timingIterator = this.leaf$chunkEntityTickNanos.long2LongEntrySet().fastIterator();
++        while (timingIterator.hasNext()) {
++            final var entry = timingIterator.next();
++            final long totalNanos = entry.getLongValue();
++            if (totalNanos < maxChunkNanos) {
++                continue;
++            }
++            final long chunkKey = entry.getLongKey();
++            final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices slices =
++                this.moonrise$getEntityLookup().getChunk(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
++            if (slices == null || slices.getEntityCount() < minEntities) {
++                continue;
++            }
++            final int strikes = this.leaf$chunkLagStrikes.addTo(chunkKey, 1) + 1;
++            if (strikes >= requiredChunkStrikes) {
++                this.leaf$cullLaggingChunkEntities(slices, totalNanos);
++                this.leaf$chunkLagStrikes.remove(chunkKey);
++            }
++        }
++    }
++
++    private void leaf$cullLaggingChunkEntities(
++        final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices slices,
++        final long totalNanos
++    ) {
++        if (slices.isEmpty()) {
++            return;
++        }
++
++        final List<Entity> chunkEntities = slices.getAllEntities();
++        final List<Entity> fallingBlocks = new ArrayList<>();
++        final List<Entity> projectiles = new ArrayList<>();
++        final List<Entity> items = new ArrayList<>();
++        final List<Entity> minecarts = new ArrayList<>();
++        final List<Entity> boats = new ArrayList<>();
++        final List<Entity> mobs = new ArrayList<>();
++
++        for (int i = 0, len = chunkEntities.size(); i < len; i++) {
++            final Entity entity = chunkEntities.get(i);
++            if (entity.isRemoved() || entity.leaf$isProtectedExcludingItems()) {
++                continue;
++            }
++            if (entity instanceof net.minecraft.world.entity.item.FallingBlockEntity) {
++                fallingBlocks.add(entity);
++            } else if (entity instanceof net.minecraft.world.entity.projectile.Projectile) {
++                projectiles.add(entity);
++            } else if (entity instanceof net.minecraft.world.entity.item.ItemEntity) {
++                items.add(entity);
++            } else if (entity instanceof net.minecraft.world.entity.vehicle.minecart.AbstractMinecart) {
++                minecarts.add(entity);
++            } else if (entity instanceof net.minecraft.world.entity.vehicle.boat.AbstractBoat) {
++                boats.add(entity);
++            } else if (entity instanceof Mob) {
++                mobs.add(entity);
++            }
++        }
++
++        final int removedFalling = leaf$discardCandidates(fallingBlocks, 0);
++        final int removedProj = leaf$discardCandidates(projectiles, 0);
++        final int removedItems = items.size() > org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.maxItemsInChunkBeforeCull
++            ? leaf$discardCandidates(items, 0)
++            : 0;
++        final int removedCarts = leaf$discardCandidates(minecarts, 0);
++        final int removedBoats = leaf$discardCandidates(boats, 0);
++        final int removedMobs = leaf$discardCandidates(mobs, LEAF_LAGGING_CHUNK_MAX_MOBS);
++        final int totalRemoved = removedFalling + removedProj + removedItems + removedCarts + removedBoats + removedMobs;
++
++        if (totalRemoved > 0 && org.dreeam.leaf.config.modules.opt.LaggingEntityGuard.logRemovals) {
++            LOGGER.warn(
++                "[LaggingEntityGuard] Culled {} lagging entities in chunk ({}, {}) of {} (tick took {} ms; falling={}, proj={}, item={}, cart={}, boat={}, mob={})",
++                totalRemoved,
++                slices.chunkX, slices.chunkZ,
++                this.getWorld().getName(),
++                String.format(Locale.ROOT, "%.2f", totalNanos / 1_000_000.0),
++                removedFalling, removedProj, removedItems, removedCarts, removedBoats, removedMobs
++            );
++        }
++    }
++
++    private static int leaf$discardCandidates(final List<Entity> candidates, final int keepCount) {
++        int removed = 0;
++        for (int i = keepCount, len = candidates.size(); i < len; i++) {
++            final Entity entity = candidates.get(i);
++            if (!entity.isRemoved()) {
++                entity.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DISCARD);
++                removed++;
++            }
++        }
++        return removed;
++    }
++    // Leaf end - LaggingEntityGuard chunk lag machine watchdog & priority culling
++
+     private void tickPassenger(Entity ridingEntity, Entity passengerEntity, final boolean isActive) { // Paper - EAR 2
+         if (passengerEntity.isRemoved() || passengerEntity.getVehicle() != ridingEntity) {
+             passengerEntity.stopRiding();
+@@ -2152,6 +2366,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         }
+ 
+         this.getChunkSource().blockChanged(pos);
++        // Leaf start - O(1) skip navigation update when block pathType and collision shape reference are unchanged
++        if (oldState.pathType == newState.pathType && oldState.getCollisionShape(this, pos) == newState.getCollisionShape(this, pos)) {
++            return;
++        }
++        // Leaf end - O(1) skip navigation update
+         this.pathTypesByPosCache.invalidate(pos);
+         if (this.paperConfig().misc.updatePathfindingOnBlockUpdate) { // Paper - option to disable pathfinding updates
+         VoxelShape collisionShape = oldState.getCollisionShape(this, pos);
+@@ -2697,9 +2916,14 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+     @Override
+     public void updatePOIOnBlockStateChange(BlockPos pos, BlockState oldState, BlockState newState) {
+-        Optional<Holder<PoiType>> optional = PoiTypes.forState(oldState);
+-        Optional<Holder<PoiType>> optional1 = PoiTypes.forState(newState);
+-        if (!Objects.equals(optional, optional1)) {
++        // Leaf start - O(1) POI lookup via cached BlockStateBase fields
++        if (oldState.leaf$poiType == newState.leaf$poiType) {
++            return;
++        }
++        Optional<Holder<PoiType>> optional = oldState.leaf$poiTypeOptional;
++        Optional<Holder<PoiType>> optional1 = newState.leaf$poiTypeOptional;
++        {
++            // Leaf end - O(1) POI lookup via cached BlockStateBase fields
+             BlockPos blockPos = pos.immutable();
+             optional.ifPresent(holder -> this.getServer().execute(() -> {
+                 this.getPoiManager().remove(blockPos);
+diff --git a/net/minecraft/server/waypoints/ServerWaypointManager.java b/net/minecraft/server/waypoints/ServerWaypointManager.java
+index 81b60e5f6ed263e8bfabd673e3b0fb74efc5a9ba..de77a20b72d83d401128603b0706033953911ab0 100644
+--- a/net/minecraft/server/waypoints/ServerWaypointManager.java
++++ b/net/minecraft/server/waypoints/ServerWaypointManager.java
+@@ -1,16 +1,14 @@
+ package net.minecraft.server.waypoints;
+ 
+ import com.google.common.collect.HashBasedTable;
+-import com.google.common.collect.ImmutableSet;
+-import com.google.common.collect.Sets;
+ import com.google.common.collect.Table;
+-import com.google.common.collect.Tables;
+-import com.google.common.collect.Sets.SetView;
++import it.unimi.dsi.fastutil.objects.Reference2LongMap;
++import it.unimi.dsi.fastutil.objects.Reference2LongOpenHashMap;
+ import java.util.HashSet;
+-import java.util.Map;
+ import java.util.Set;
+-import java.util.Map.Entry;
++import net.minecraft.core.BlockPos;
+ import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.entity.Entity;
+ import net.minecraft.world.level.gamerules.GameRules;
+ import net.minecraft.world.waypoints.WaypointManager;
+ import net.minecraft.world.waypoints.WaypointTransmitter;
+@@ -19,6 +17,8 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     private final Set<WaypointTransmitter> waypoints = new HashSet<>();
+     private final Set<ServerPlayer> players = new HashSet<>();
+     private final Table<ServerPlayer, WaypointTransmitter, WaypointTransmitter.Connection> connections = HashBasedTable.create();
++    private final Reference2LongMap<ServerPlayer> lastPlayerBlockPos = new Reference2LongOpenHashMap<>();
++    private final Reference2LongMap<WaypointTransmitter> lastWaypointBlockPos = new Reference2LongOpenHashMap<>();
+     public boolean locatorBarEnabled; // Paper - optimize ServerWaypointManager with locator bar disabled - Avoid a gamerule lookup for each player
+ 
+     // Leaf start - SparklyPaper - parallel world ticking
+@@ -26,6 +26,8 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     public ServerWaypointManager(net.minecraft.server.level.ServerLevel level) {
+         this.level = level;
+         this.locatorBarEnabled = level.getGameRules().get(GameRules.LOCATOR_BAR); // Paper - optimize ServerWaypointManager with locator bar disabled
++        this.lastPlayerBlockPos.defaultReturnValue(Long.MIN_VALUE);
++        this.lastWaypointBlockPos.defaultReturnValue(Long.MIN_VALUE);
+     }
+     // Leaf end - SparklyPaper - parallel world ticking
+ 
+@@ -34,6 +36,8 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, "Cannot track waypoints off-main"); // Leaf - SparklyPaper - parallel world ticking
+         this.waypoints.add(waypoint);
++        this.lastWaypointBlockPos.removeLong(waypoint);
++        this.lastPlayerBlockPos.clear();
+ 
+         for (ServerPlayer serverPlayer : this.players) {
+             this.createConnection(serverPlayer, waypoint);
+@@ -44,16 +48,28 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     public void updateWaypoint(WaypointTransmitter waypoint) {
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, "Cannot update waypoints off-main"); // Leaf - SparklyPaper - parallel world ticking
++        if (this.players.isEmpty() || (this.waypoints.size() <= 1 && this.connections.isEmpty())) {
++            return;
++        }
+         if (this.waypoints.contains(waypoint)) {
+-            Map<ServerPlayer, WaypointTransmitter.Connection> map = Tables.transpose(this.connections).row(waypoint);
+-            SetView<ServerPlayer> set = Sets.difference(this.players, map.keySet());
+-
+-            for (Entry<ServerPlayer, WaypointTransmitter.Connection> entry : ImmutableSet.copyOf(map.entrySet())) {
+-                this.updateConnection(entry.getKey(), waypoint, entry.getValue());
++            if (waypoint instanceof Entity entity) {
++                final long packedPos = BlockPos.asLong(entity.getBlockX(), entity.getBlockY(), entity.getBlockZ());
++                if (this.lastWaypointBlockPos.getLong(waypoint) == packedPos) {
++                    return;
++                }
++                this.lastWaypointBlockPos.put(waypoint, packedPos);
+             }
+ 
+-            for (ServerPlayer serverPlayer : set) {
+-                this.createConnection(serverPlayer, waypoint);
++            for (ServerPlayer serverPlayer : this.players) {
++                if (serverPlayer == waypoint) {
++                    continue;
++                }
++                WaypointTransmitter.Connection connection = this.connections.get(serverPlayer, waypoint);
++                if (connection != null) {
++                    this.updateConnection(serverPlayer, waypoint, connection);
++                } else {
++                    this.createConnection(serverPlayer, waypoint);
++                }
+             }
+         }
+     }
+@@ -61,15 +77,25 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     @Override
+     public void untrackWaypoint(WaypointTransmitter waypoint) {
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, "Cannot untrack waypoints off-main"); // Leaf - SparklyPaper - parallel world ticking
+-        this.connections.column(waypoint).forEach((serverPlayer, connection) -> connection.disconnect());
+-        Tables.transpose(this.connections).row(waypoint).clear();
++        if (!this.connections.isEmpty()) {
++            for (ServerPlayer serverPlayer : this.players) {
++                WaypointTransmitter.Connection connection = this.connections.remove(serverPlayer, waypoint);
++                if (connection != null) {
++                    connection.disconnect();
++                }
++            }
++        }
+         this.waypoints.remove(waypoint);
++        this.lastWaypointBlockPos.removeLong(waypoint);
++        this.lastPlayerBlockPos.clear();
+     }
+ 
+     public void addPlayer(ServerPlayer player) {
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, "Cannot add player to waypoints off-main"); // Leaf - SparklyPaper - parallel world ticking
+         this.players.add(player);
++        this.lastPlayerBlockPos.removeLong(player);
++        this.lastWaypointBlockPos.clear();
+ 
+         for (WaypointTransmitter waypointTransmitter : this.waypoints) {
+             this.createConnection(player, waypointTransmitter);
+@@ -83,26 +109,40 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+     public void updatePlayer(ServerPlayer player) {
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, "Cannot update player for waypoints off-main"); // Leaf - SparklyPaper - parallel world ticking
+-        Map<WaypointTransmitter, WaypointTransmitter.Connection> map = this.connections.row(player);
+-        SetView<WaypointTransmitter> set = Sets.difference(this.waypoints, map.keySet());
+-
+-        for (Entry<WaypointTransmitter, WaypointTransmitter.Connection> entry : ImmutableSet.copyOf(map.entrySet())) {
+-            this.updateConnection(player, entry.getKey(), entry.getValue());
++        if (this.players.isEmpty() || (this.waypoints.size() <= 1 && this.connections.isEmpty())) {
++            return;
+         }
++        final long packedPos = BlockPos.asLong(player.getBlockX(), player.getBlockY(), player.getBlockZ());
++        if (this.lastPlayerBlockPos.getLong(player) == packedPos) {
++            return;
++        }
++        this.lastPlayerBlockPos.put(player, packedPos);
+ 
+-        for (WaypointTransmitter waypointTransmitter : set) {
+-            this.createConnection(player, waypointTransmitter);
++        for (WaypointTransmitter waypointTransmitter : this.waypoints) {
++            if (waypointTransmitter == player) {
++                continue;
++            }
++            WaypointTransmitter.Connection connection = this.connections.get(player, waypointTransmitter);
++            if (connection != null) {
++                this.updateConnection(player, waypointTransmitter, connection);
++            } else {
++                this.createConnection(player, waypointTransmitter);
++            }
+         }
+     }
+ 
+     public void removePlayer(ServerPlayer player) {
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, "Cannot remove player from waypoints off-main"); // Leaf - SparklyPaper - parallel world ticking
+-        this.connections.row(player).values().removeIf(connection -> {
+-            connection.disconnect();
+-            return true;
+-        });
++        if (!this.connections.isEmpty()) {
++            this.connections.row(player).values().removeIf(connection -> {
++                connection.disconnect();
++                return true;
++            });
++        }
+         this.untrackWaypoint((WaypointTransmitter)player);
+         this.players.remove(player);
++        this.lastPlayerBlockPos.removeLong(player);
++        this.lastWaypointBlockPos.removeLong((WaypointTransmitter)player);
+     }
+ 
+     public void breakAllConnections() {
+@@ -110,11 +150,15 @@ public class ServerWaypointManager implements WaypointManager<WaypointTransmitte
+         if (!this.locatorBarEnabled && this.connections.isEmpty()) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         this.connections.values().forEach(WaypointTransmitter.Connection::disconnect);
+         this.connections.clear();
++        this.lastPlayerBlockPos.clear();
++        this.lastWaypointBlockPos.clear();
+     }
+ 
+     public void remakeConnections(WaypointTransmitter waypoint) {
+         if (!this.locatorBarEnabled) return; // Paper - optimize ServerWaypointManager with locator bar disabled
+         if (org.dreeam.leaf.config.modules.async.SparklyPaperParallelWorldTicking.enabled) { ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.level, "Cannot remake waypoint connections off-main"); } // Leaf - SparklyPaper - parallel world ticking
++        this.lastPlayerBlockPos.clear();
++        this.lastWaypointBlockPos.removeLong(waypoint);
+         for (ServerPlayer serverPlayer : this.players) {
+             this.createConnection(serverPlayer, waypoint);
+         }
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 6ef8d3f41049f6c7399a66cfdccaec8abf4a1e9a..bdb9138e2fce9973300ddeee5b0e0be28037d3e0 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -189,6 +189,73 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     }
+     // Paper end - Share random for entities to make them more random
+     public org.bukkit.event.entity.CreatureSpawnEvent.@Nullable SpawnReason spawnReason; // Paper - Entity#getEntitySpawnReason
++    // Leaf start - LaggingEntityGuard entity strike tracking & NPC/boss protection
++    public transient int leaf$lagStrikes = 0;
++
++    public final boolean leaf$isProtectedFromLagCull() {
++        return this instanceof net.minecraft.world.entity.item.ItemEntity
++            || this instanceof net.minecraft.world.entity.ExperienceOrb
++            || this.leaf$isProtectedExcludingItems();
++    }
++
++    public final boolean leaf$isProtectedExcludingItems() {
++        if (this instanceof net.minecraft.world.entity.player.Player
++            || this instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragon
++            || this instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragonPart
++            || this instanceof net.minecraft.world.entity.boss.wither.WitherBoss) {
++            return true;
++        }
++        if (this instanceof net.minecraft.world.entity.TamableAnimal tamable && tamable.isTame()) {
++            return true;
++        }
++        if (this.hasCustomName() || this.isInvulnerable()) {
++            return true;
++        }
++        if (!this.passengers.isEmpty()) {
++            for (int i = 0, len = this.passengers.size(); i < len; i++) {
++                if (this.passengers.get(i).leaf$isProtectedExcludingItems()) {
++                    return true;
++                }
++            }
++        }
++        if (!this.tags.isEmpty()) {
++            for (final String tag : this.tags) {
++                if (leaf$containsAsciiIgnoreCase(tag, "npc")) {
++                    return true;
++                }
++            }
++        }
++        final org.bukkit.craftbukkit.entity.CraftEntity craft = this.getBukkitEntityRaw();
++        if (craft != null) {
++            if (craft.hasMetadata("NPC") || craft.hasMetadata("npc")) {
++                return true;
++            }
++            final org.bukkit.craftbukkit.persistence.CraftPersistentDataContainer pdc = craft.getPersistentDataContainer();
++            if (!pdc.isEmpty()) {
++                for (final String rawKey : pdc.getRaw().keySet()) {
++                    if (leaf$containsAsciiIgnoreCase(rawKey, "npc")) {
++                        return true;
++                    }
++                }
++            }
++        }
++        return false;
++    }
++
++    private static boolean leaf$containsAsciiIgnoreCase(final String haystack, final String needle) {
++        final int hayLen = haystack.length();
++        final int needleLen = needle.length();
++        if (needleLen == 0 || hayLen < needleLen) {
++            return false;
++        }
++        for (int i = 0; i <= hayLen - needleLen; i++) {
++            if (haystack.regionMatches(true, i, needle, 0, needleLen)) {
++                return true;
++            }
++        }
++        return false;
++    }
++    // Leaf end - LaggingEntityGuard entity strike tracking & NPC/boss protection
+ 
+     private volatile org.bukkit.craftbukkit.entity.@Nullable CraftEntity bukkitEntity; // Paper - Folia schedulers - volatile
+ 
+@@ -1820,20 +1887,28 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+                 }
+             }
+ 
+-            set.clear();
++            if (!set.isEmpty()) {
++                set.clear();
++            }
+         }
+     }
+ 
+     // Leaf start - optimize checkInsideBlocks calls
+     private int checkInsideBlocks(Vec3 from, Vec3 to, InsideBlockEffectApplier.StepBasedCollector stepBasedCollector, LongSet visited, int maxSteps) {
++        if (!this.isAlive() || maxSteps <= 0) {
++            return 0;
++        }
+         final Level level = this.level();
+-        AABB aabb = this.getBoundingBox().move(to.subtract(this.position())).deflate(1.0E-5F);
++        final AABB aabb = this.getBoundingBox().move(to.subtract(this.position())).deflate(1.0E-5F);
++        final boolean flag1 = this.level instanceof ServerLevel serverLevel
++            && serverLevel.getServer().debugSubscribers().hasAnySubscriberFor(DebugSubscriptions.ENTITY_BLOCK_INTERSECTIONS);
++        if (!flag1 && !(this instanceof Player) && !this.isClientAuthoritative() && from.distanceToSqr(to) < 0.0625D) {
++            return this.leaf$checkInsideBlocksFast(level, from, to, aabb, stepBasedCollector, visited, maxSteps);
++        }
+         final net.minecraft.world.level.chunk.ChunkAccess[] cachedChunk = {null};
+         final long[] cachedChunkPos = { Long.MIN_VALUE };
+ 
+         boolean flag = from.distanceToSqr(to) > Mth.square(0.9999900000002526);
+-        boolean flag1 = this.level instanceof ServerLevel serverLevel
+-            && serverLevel.getServer().debugSubscribers().hasAnySubscriberFor(DebugSubscriptions.ENTITY_BLOCK_INTERSECTIONS);
+         AtomicInteger atomicInteger = new AtomicInteger();
+         BlockGetter.forEachBlockIntersectedBetween(
+             from,
+@@ -1914,6 +1989,115 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+         );
+         return atomicInteger.get() + 1;
+     }
++
++    private int leaf$checkInsideBlocksFast(
++        final Level level,
++        final Vec3 from,
++        final Vec3 to,
++        final AABB aabb,
++        final InsideBlockEffectApplier.StepBasedCollector stepBasedCollector,
++        final LongSet visited,
++        final int maxSteps
++    ) {
++        final double dx = from.x - to.x;
++        final double dy = from.y - to.y;
++        final double dz = from.z - to.z;
++        final int minLevelSection = ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection(level);
++        final int maxLevelSection = ca.spottedleaf.moonrise.common.util.WorldUtil.getMaxSection(level);
++        final int minX = Mth.floor(dx < 0.0 ? aabb.minX + dx : aabb.minX);
++        final int maxX = Mth.floor(dx > 0.0 ? aabb.maxX + dx : aabb.maxX);
++        final int minY = Math.max(minLevelSection << 4, Mth.floor(dy < 0.0 ? aabb.minY + dy : aabb.minY));
++        final int maxY = Math.min((maxLevelSection << 4) | 15, Mth.floor(dy > 0.0 ? aabb.maxY + dy : aabb.maxY));
++        final int minZ = Mth.floor(dz < 0.0 ? aabb.minZ + dz : aabb.minZ);
++        final int maxZ = Mth.floor(dz > 0.0 ? aabb.maxZ + dz : aabb.maxZ);
++        if (minY > maxY) {
++            return 1;
++        }
++
++        final int minChunkX = minX >> 4;
++        final int maxChunkX = maxX >> 4;
++        final int minChunkZ = minZ >> 4;
++        final int maxChunkZ = maxZ >> 4;
++        final int minSectionY = minY >> 4;
++        final int maxSectionY = maxY >> 4;
++
++        BlockPos.MutableBlockPos mutablePos = null;
++        int stepIndex = 0;
++
++        for (int currChunkZ = minChunkZ; currChunkZ <= maxChunkZ; ++currChunkZ) {
++            final int chunkMinZ = Math.max(minZ, currChunkZ << 4);
++            final int chunkMaxZ = Math.min(maxZ, (currChunkZ << 4) | 15);
++            for (int currChunkX = minChunkX; currChunkX <= maxChunkX; ++currChunkX) {
++                final net.minecraft.world.level.chunk.ChunkAccess chunk = level.getChunkIfLoaded(currChunkX, currChunkZ);
++                if (chunk == null) {
++                    continue;
++                }
++                final net.minecraft.world.level.chunk.LevelChunkSection[] sections = chunk.getSections();
++                final int chunkMinX = Math.max(minX, currChunkX << 4);
++                final int chunkMaxX = Math.min(maxX, (currChunkX << 4) | 15);
++
++                for (int currSecY = minSectionY; currSecY <= maxSectionY; ++currSecY) {
++                    final net.minecraft.world.level.chunk.LevelChunkSection section = sections[currSecY - minLevelSection];
++                    if (section == null || section.hasOnlyAir()) {
++                        continue;
++                    }
++                    final int secMinY = Math.max(minY, currSecY << 4);
++                    final int secMaxY = Math.min(maxY, (currSecY << 4) | 15);
++
++                    for (int y = secMinY; y <= secMaxY; ++y) {
++                        final int localY = y & 15;
++                        for (int z = chunkMinZ; z <= chunkMaxZ; ++z) {
++                            final int localZ = z & 15;
++                            for (int x = chunkMinX; x <= chunkMaxX; ++x) {
++                                final BlockState blockState = section.getBlockState(x & 15, localY, localZ);
++                                if (!blockState.leaf$hasInsideBlockEffect) {
++                                    continue;
++                                }
++                                if (!this.isAlive() || this.level() != level || stepIndex >= maxSteps) {
++                                    return stepIndex + 1;
++                                }
++                                if (mutablePos == null) {
++                                    mutablePos = new BlockPos.MutableBlockPos();
++                                }
++                                mutablePos.set(x, y, z);
++
++                                final VoxelShape entityInsideCollisionShape = blockState.getEntityInsideCollisionShape(level, mutablePos, this);
++                                final boolean hitBlock = entityInsideCollisionShape == Shapes.block()
++                                    || this.collidedWithShapeMovingFrom(from, to, entityInsideCollisionShape.move(mutablePos.getX(), mutablePos.getY(), mutablePos.getZ()));
++                                final FluidState fluidState = blockState.getFluidState();
++                                final boolean hitFluid = !fluidState.isEmpty() && this.collidedWithFluid(fluidState, mutablePos, from, to);
++
++                                if ((hitBlock || hitFluid) && visited.add(mutablePos.asLong())) {
++                                    final int currentStep = stepIndex++;
++                                    if (hitBlock) {
++                                        try {
++                                            stepBasedCollector.advanceStep(currentStep, mutablePos);
++                                            blockState.entityInside(level, mutablePos, this, stepBasedCollector, aabb.intersects(mutablePos));
++                                            this.onInsideBlock(blockState);
++                                        } catch (Throwable var20) {
++                                            CrashReport crashReport = CrashReport.forThrowable(var20, "Colliding entity with block");
++                                            CrashReportCategory crashReportCategory = crashReport.addCategory("Block being collided with");
++                                            CrashReportCategory.populateBlockDetails(crashReportCategory, this.level(), mutablePos, blockState);
++                                            CrashReportCategory crashReportCategory1 = crashReport.addCategory("Entity being checked for collision");
++                                            this.fillCrashReportCategory(crashReportCategory1);
++                                            throw new ReportedException(crashReport);
++                                        }
++                                    }
++
++                                    if (hitFluid) {
++                                        stepBasedCollector.advanceStep(currentStep, mutablePos);
++                                        fluidState.entityInside(level, mutablePos, this, stepBasedCollector);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        return stepIndex + 1;
++    }
+     // Leaf end - optimize checkInsideBlocks calls
+ 
+     private void debugBlockIntersection(ServerLevel level, BlockPos pos, boolean inBlock, boolean inFluid) {
+@@ -5015,42 +5199,83 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+         final int maxBlockY = Math.min((ca.spottedleaf.moonrise.common.util.WorldUtil.getMaxSection(world) << 4) | 15, Mth.ceil(boundingBox.maxY) - 1);
+         final int maxBlockZ = Mth.ceil(boundingBox.maxZ) - 1;
+ 
+-        final boolean isPushable = this.isPushedByFluid();
+-        final BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+-
+-        Vec3 pushVector = Vec3.ZERO;
+-        double totalPushes = 0.0;
+-        double maxHeightDiff = 0.0;
+-        boolean inFluid = false;
+-
+         final int minChunkX = minBlockX >> 4;
+         final int maxChunkX = maxBlockX >> 4;
+ 
+         final int minChunkZ = minBlockZ >> 4;
+         final int maxChunkZ = maxBlockZ >> 4;
+ 
+-        final net.minecraft.server.level.ServerChunkCache chunkSource = ((ServerLevel) world).chunkSource; // Leaf - optimize entity in fluid
+-
+-        final int chunkLenX = maxChunkX - minChunkX + 1;
+-        // chunk index = (x - minX) + (maxX-minX+1)*(z - minZ)
+-        //             = x + (maxX-minX+1)*z - (minX + (maxX-minX+1)*minZ)
+-        final int chunkOffset = -(minChunkX + chunkLenX*minChunkZ);
+-        //             = x + (maxX-minX+1)*z + chunkOffset
+-        final net.minecraft.world.level.chunk.LevelChunkSection[][] sections = new net.minecraft.world.level.chunk.LevelChunkSection[chunkLenX * (maxChunkZ - minChunkZ + 1)][];
++        final int minSecY = minBlockY >> 4;
++        final int maxSecY = maxBlockY >> 4;
++        if (minBlockY > maxBlockY) {
++            this.fluidHeight.put(fluid, 0.0);
++            return false;
++        }
+ 
+-        // init chunks
+-        for (int currChunkZ = minChunkZ; currChunkZ <= maxChunkZ; ++currChunkZ) {
+-            for (int currChunkX = minChunkX; currChunkX <= maxChunkX; ++currChunkX) {
+-                sections[currChunkX + chunkLenX*currChunkZ + chunkOffset] = chunkSource.fullChunksNonSync.get(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(currChunkX, currChunkZ)).getSections(); // Leaf - optimize entity in fluid
++        final net.minecraft.server.level.ServerChunkCache chunkSource = ((ServerLevel) world).chunkSource; // Leaf - optimize entity in fluid
++        final boolean singleChunk = minChunkX == maxChunkX && minChunkZ == maxChunkZ;
++        net.minecraft.world.level.chunk.LevelChunkSection[] singleSections = null;
++        net.minecraft.world.level.chunk.LevelChunkSection[][] sections = null;
++        int chunkLenX = 1;
++        int chunkOffset = 0;
++        boolean hasAnyFluidSection = false;
++
++        if (singleChunk) {
++            singleSections = chunkSource.fullChunksNonSync
++                .get(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(minChunkX, minChunkZ)).getSections();
++            for (int secY = minSecY; secY <= maxSecY; ++secY) {
++                final net.minecraft.world.level.chunk.LevelChunkSection section = singleSections[secY - minSection];
++                if (section != null && section.hasFluids()) {
++                    hasAnyFluidSection = true;
++                    break;
++                }
++            }
++        } else {
++            chunkLenX = maxChunkX - minChunkX + 1;
++            chunkOffset = -(minChunkX + chunkLenX * minChunkZ);
++            sections = new net.minecraft.world.level.chunk.LevelChunkSection[chunkLenX * (maxChunkZ - minChunkZ + 1)][];
++
++            for (int currChunkZ = minChunkZ; currChunkZ <= maxChunkZ; ++currChunkZ) {
++                for (int currChunkX = minChunkX; currChunkX <= maxChunkX; ++currChunkX) {
++                    final net.minecraft.world.level.chunk.LevelChunkSection[] chunkSections = chunkSource.fullChunksNonSync
++                        .get(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkKey(currChunkX, currChunkZ)).getSections();
++                    sections[currChunkX + chunkLenX * currChunkZ + chunkOffset] = chunkSections;
++                    if (!hasAnyFluidSection) {
++                        for (int secY = minSecY; secY <= maxSecY; ++secY) {
++                            final net.minecraft.world.level.chunk.LevelChunkSection section = chunkSections[secY - minSection];
++                            if (section != null && section.hasFluids()) {
++                                hasAnyFluidSection = true;
++                                break;
++                            }
++                        }
++                    }
++                }
+             }
+         }
+ 
++        if (!hasAnyFluidSection) {
++            this.fluidHeight.put(fluid, 0.0);
++            return false;
++        }
++
++        final boolean isPushable = this.isPushedByFluid();
++        final BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
++
++        Vec3 pushVector = Vec3.ZERO;
++        double totalPushes = 0.0;
++        double maxHeightDiff = 0.0;
++        boolean inFluid = false;
++
+         for (int currX = minBlockX; currX <= maxBlockX; ++currX) {
+-            for (int currY = minBlockY; currY <= maxBlockY; ++currY) {
+-                for (int currZ = minBlockZ; currZ <= maxBlockZ; ++currZ) {
++            for (int currZ = minBlockZ; currZ <= maxBlockZ; ++currZ) {
++                final net.minecraft.world.level.chunk.LevelChunkSection[] colSections = singleChunk
++                    ? singleSections
++                    : sections[(currX >> 4) + chunkLenX * (currZ >> 4) + chunkOffset];
++                for (int currY = minBlockY; currY <= maxBlockY; ++currY) {
+                     // Leaf start - optimize entity in fluid
+-                    final net.minecraft.world.level.chunk.LevelChunkSection section = sections[(currX >> 4) + chunkLenX*(currZ >> 4) + chunkOffset][(currY >> 4) - minSection];
+-                    if (section.fluidCount <= 0) {
++                    final net.minecraft.world.level.chunk.LevelChunkSection section = colSections[(currY >> 4) - minSection];
++                    if (section == null || !section.hasFluids()) {
++                        currY = ((currY >> 4) << 4) + 15;
+                         continue;
+                     }
+                     final FluidState fluidState = section.states.get((currX & 15) | ((currZ & 15) << 4) | ((currY & 15) << 8)).getFluidState();
+diff --git a/net/minecraft/world/entity/item/FallingBlockEntity.java b/net/minecraft/world/entity/item/FallingBlockEntity.java
+index 419982ecea1e846c997db9d9b35958d1d8dcc0e2..9c7963220e2ec6337311e16991060d1a2d144aaa 100644
+--- a/net/minecraft/world/entity/item/FallingBlockEntity.java
++++ b/net/minecraft/world/entity/item/FallingBlockEntity.java
+@@ -153,7 +153,40 @@ public class FallingBlockEntity extends Entity {
+             Block block = this.blockState.getBlock();
+             this.time++;
+             this.applyGravity();
+-            this.move(MoverType.SELF, this.getDeltaMovement());
++            // Leaf start - cobweb micro-movement fast path
++            if (!this.noPhysics && this.stuckSpeedMultiplier.lengthSqr() > 1.0E-7D) {
++                final Vec3 scaledMove = this.getDeltaMovement().multiply(this.stuckSpeedMultiplier);
++                final net.minecraft.world.phys.AABB box = this.getBoundingBox();
++                final int cellX = Mth.floor(this.getX());
++                final int cellY = Mth.floor(this.getY());
++                final int cellZ = Mth.floor(this.getZ());
++                final double newMinY = box.minY + scaledMove.y;
++                final double newMinX = box.minX + scaledMove.x;
++                final double newMaxX = box.maxX + scaledMove.x;
++                final double newMinZ = box.minZ + scaledMove.z;
++                final double newMaxZ = box.maxZ + scaledMove.z;
++                if (scaledMove.y <= 0.0D
++                    && scaledMove.y >= -0.25D
++                    && newMinY > cellY + 0.01D
++                    && newMinX >= cellX && newMaxX <= cellX + 1.0D
++                    && newMinZ >= cellZ && newMaxZ <= cellZ + 1.0D
++                    && (!(this.level() instanceof ServerLevel sl) || !sl.moonrise$getEntityLookup().hasHardCollidingEntities())
++                    && this.level().getBlockState(this.blockPosition()).getCollisionShape(this.level(), this.blockPosition()).isEmpty()
++                    && (box.maxY <= cellY + 1.0D || this.level().getBlockState(this.blockPosition().above()).getCollisionShape(this.level(), this.blockPosition().above()).isEmpty())) {
++                    this.stuckSpeedMultiplier = Vec3.ZERO;
++                    this.setDeltaMovement(Vec3.ZERO);
++                    this.setPos(this.getX() + scaledMove.x, this.getY() + scaledMove.y, this.getZ() + scaledMove.z);
++                    this.horizontalCollision = false;
++                    this.verticalCollision = false;
++                    this.verticalCollisionBelow = false;
++                    this.setOnGroundWithMovement(false, false, scaledMove);
++                } else {
++                    this.move(MoverType.SELF, this.getDeltaMovement());
++                }
++            } else {
++                this.move(MoverType.SELF, this.getDeltaMovement());
++            }
++            // Leaf end - cobweb micro-movement fast path
+             this.applyEffectsFromBlocks();
+             // Paper start - Configurable falling blocks height nerf
+             if (this.level().paperConfig().fixes.fallingBlockHeightNerf.test(v -> this.getY() > v)) {
+@@ -184,6 +217,20 @@ public class FallingBlockEntity extends Entity {
+                 }
+ 
+                 if (!this.onGround() && !flag1) {
++                    // Leaf start - cap stacked low-speed falling blocks per block cell
++                    final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices leaf$slices =
++                        serverLevel.moonrise$getEntityLookup().getChunk(blockPos.getX() >> 4, blockPos.getZ() >> 4);
++                    if (leaf$slices != null
++                        && d < 0.0001D
++                        && leaf$slices.exceedsSameCellEntityLimit(
++                            this, EntityType.FALLING_BLOCK, blockPos.getX(), blockPos.getY(), blockPos.getZ(), 0.0001D, 8)) {
++                        if (this.dropItem && serverLevel.getGameRules().get(GameRules.ENTITY_DROPS)) {
++                            this.spawnAtLocation(serverLevel, block);
++                        }
++                        this.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DROP);
++                        return;
++                    }
++                    // Leaf end - cap stacked low-speed falling blocks per block cell
+                     if ((this.time > 100 && autoExpire) && (blockPos.getY() <= this.level().getMinY() || blockPos.getY() > this.level().getMaxY()) || (this.time > 600 && autoExpire)) { // Paper - Expand FallingBlock API
+                         if (this.dropItem && serverLevel.getGameRules().get(GameRules.ENTITY_DROPS)) {
+                             this.spawnAtLocation(serverLevel, block);
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index f1c4c418c44192145ac7acb2a19bd4a2caba4762..df16a023b8ece6738387fddbd90f72e90661bf53 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -279,9 +279,13 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+     @Override
+     public final List<Entity> moonrise$getHardCollidingEntities(final Entity entity, final AABB box, final Predicate<? super Entity> predicate) {
+         Profiler.get().incrementCounter("getEntities");
++        final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup lookup = ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel)this).moonrise$getEntityLookup();
++        if (!lookup.hasHardCollidingEntities()) {
++            return java.util.Collections.emptyList();
++        }
+         final List<Entity> ret = new java.util.ArrayList<>();
+ 
+-        ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel)this).moonrise$getEntityLookup().getHardCollidingEntities(entity, box, ret, predicate);
++        lookup.getHardCollidingEntities(entity, box, ret, predicate);
+ 
+         return ret;
+     }
+diff --git a/net/minecraft/world/level/block/BasePressurePlateBlock.java b/net/minecraft/world/level/block/BasePressurePlateBlock.java
+index 7135a6bc87f90fafa94d0783aaf7b42d66449010..98d662e5191d82460ef28136c50930533635c177 100644
+--- a/net/minecraft/world/level/block/BasePressurePlateBlock.java
++++ b/net/minecraft/world/level/block/BasePressurePlateBlock.java
+@@ -97,7 +97,7 @@ public abstract class BasePressurePlateBlock extends Block {
+         boolean flag1 = signalStrength > 0;
+ 
+         // CraftBukkit start - Interact Pressure Plate
+-        if (flag != flag1) {
++        if (flag != flag1 && org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
+             org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), currentSignal, signalStrength);
+             eventRedstone.callEvent();
+ 
+diff --git a/net/minecraft/world/level/block/ButtonBlock.java b/net/minecraft/world/level/block/ButtonBlock.java
+index 27ca29f1d3e0e68229edef3b32634ce9b054824a..66612a65cd09f3c3b20f2629bc13cdc245f29d93 100644
+--- a/net/minecraft/world/level/block/ButtonBlock.java
++++ b/net/minecraft/world/level/block/ButtonBlock.java
+@@ -90,16 +90,18 @@ public class ButtonBlock extends FaceAttachedHorizontalDirectionalBlock {
+             return InteractionResult.CONSUME;
+         } else {
+             // CraftBukkit start
+-            boolean powered = state.getValue(ButtonBlock.POWERED);
+-            org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+-            int old = (powered) ? 15 : 0;
+-            int current = (!powered) ? 15 : 0;
+-
+-            org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(block, old, current);
+-            level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+-
+-            if ((eventRedstone.getNewCurrent() > 0) != (!powered)) {
+-                return InteractionResult.SUCCESS;
++            if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++                boolean powered = state.getValue(ButtonBlock.POWERED);
++                org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++                int old = (powered) ? 15 : 0;
++                int current = (!powered) ? 15 : 0;
++
++                org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(block, old, current);
++                level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++
++                if ((eventRedstone.getNewCurrent() > 0) != (!powered)) {
++                    return InteractionResult.SUCCESS;
++                }
+             }
+             // CraftBukkit end
+             this.press(state, level, pos, player);
+@@ -188,16 +190,18 @@ public class ButtonBlock extends FaceAttachedHorizontalDirectionalBlock {
+         // CraftBukkit end
+         if (flag != poweredValue) {
+             // CraftBukkit start
+-            boolean powered = poweredValue;
+-            org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+-            int old = (powered) ? 15 : 0;
+-            int current = (!powered) ? 15 : 0;
+-
+-            org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(block, old, current);
+-            level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+-
+-            if ((flag && eventRedstone.getNewCurrent() <= 0) || (!flag && eventRedstone.getNewCurrent() > 0)) {
+-                return;
++            if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++                boolean powered = poweredValue;
++                org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++                int old = (powered) ? 15 : 0;
++                int current = (!powered) ? 15 : 0;
++
++                org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(block, old, current);
++                level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++
++                if ((flag && eventRedstone.getNewCurrent() <= 0) || (!flag && eventRedstone.getNewCurrent() > 0)) {
++                    return;
++                }
+             }
+             // CraftBukkit end
+             level.setBlock(pos, state.setValue(POWERED, flag), Block.UPDATE_ALL);
+diff --git a/net/minecraft/world/level/block/CommandBlock.java b/net/minecraft/world/level/block/CommandBlock.java
+index b5a780a929c2b6db91d7f86d7178419f87815944..912ef9beea0c7ab92216d26eaeda2010ce98e53a 100644
+--- a/net/minecraft/world/level/block/CommandBlock.java
++++ b/net/minecraft/world/level/block/CommandBlock.java
+@@ -71,13 +71,15 @@ public class CommandBlock extends BaseEntityBlock implements GameMasterBlock {
+     private void setPoweredAndUpdate(Level level, BlockPos pos, CommandBlockEntity blockEntity, boolean powered) {
+         boolean isPowered = blockEntity.isPowered();
+         // CraftBukkit start
+-        org.bukkit.block.Block bukkitBlock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+-        int old = isPowered ? 15 : 0;
+-        int current = powered ? 15 : 0;
+-
+-        org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(bukkitBlock, old, current);
+-        level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+-        powered = eventRedstone.getNewCurrent() > 0;
++        if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++            org.bukkit.block.Block bukkitBlock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++            int old = isPowered ? 15 : 0;
++            int current = powered ? 15 : 0;
++
++            org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(bukkitBlock, old, current);
++            level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++            powered = eventRedstone.getNewCurrent() > 0;
++        }
+         // CraftBukkit end
+         if (powered != isPowered) {
+             blockEntity.setPowered(powered);
+diff --git a/net/minecraft/world/level/block/ComparatorBlock.java b/net/minecraft/world/level/block/ComparatorBlock.java
+index 7e87d56cd42f27c115b575b9acf2ce9ac0953af8..73b8fc1054f8dbb0a75f2a7119e290654f19c819 100644
+--- a/net/minecraft/world/level/block/ComparatorBlock.java
++++ b/net/minecraft/world/level/block/ComparatorBlock.java
+@@ -168,14 +168,14 @@ public class ComparatorBlock extends DiodeBlock implements EntityBlock {
+             boolean poweredValue = state.getValue(POWERED);
+             if (poweredValue && !shouldTurnOn) {
+                 // CraftBukkit start
+-                if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 15, 0).getNewCurrent() != 0) {
++                if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 15, 0) != 0) {
+                     return;
+                 }
+                 // CraftBukkit end
+                 level.setBlock(pos, state.setValue(POWERED, false), Block.UPDATE_CLIENTS);
+             } else if (!poweredValue && shouldTurnOn) {
+                 // CraftBukkit start
+-                if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 0, 15).getNewCurrent() != 15) {
++                if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 0, 15) != 15) {
+                     return;
+                 }
+                 // CraftBukkit end
+diff --git a/net/minecraft/world/level/block/DaylightDetectorBlock.java b/net/minecraft/world/level/block/DaylightDetectorBlock.java
+index 7a428ff04cdcff26f7c9582c388542ecc618506a..65790e130876cef4f0268b85535bc352c701db73 100644
+--- a/net/minecraft/world/level/block/DaylightDetectorBlock.java
++++ b/net/minecraft/world/level/block/DaylightDetectorBlock.java
+@@ -71,7 +71,7 @@ public class DaylightDetectorBlock extends BaseEntityBlock {
+ 
+         i = Mth.clamp(i, 0, 15);
+         if (state.getValue(POWER) != i) {
+-            i = org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, state.getValue(DaylightDetectorBlock.POWER), i).getNewCurrent(); // CraftBukkit - Call BlockRedstoneEvent
++            i = org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, state.getValue(DaylightDetectorBlock.POWER), i); // CraftBukkit - Call BlockRedstoneEvent
+             level.setBlock(pos, state.setValue(POWER, i), Block.UPDATE_ALL);
+         }
+     }
+diff --git a/net/minecraft/world/level/block/DetectorRailBlock.java b/net/minecraft/world/level/block/DetectorRailBlock.java
+index e7a4fe5bcb750262d7beab8d57bec59038fca241..68a2aa96cec90d44f9a465740c6f038d33a39e68 100644
+--- a/net/minecraft/world/level/block/DetectorRailBlock.java
++++ b/net/minecraft/world/level/block/DetectorRailBlock.java
+@@ -89,7 +89,7 @@ public class DetectorRailBlock extends BaseRailBlock {
+             }
+ 
+             // CraftBukkit start
+-            if (poweredValue != flag) {
++            if (poweredValue != flag && org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
+                 org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+ 
+                 org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(block, flag ? 15 : 0, flag ? 15 : 0);
+diff --git a/net/minecraft/world/level/block/DiodeBlock.java b/net/minecraft/world/level/block/DiodeBlock.java
+index ddb6b3dba945ca3b65d19f79948ec8184d0ae77a..2d189db614b482f3aaeb6c7e8f4c862b17174d3d 100644
+--- a/net/minecraft/world/level/block/DiodeBlock.java
++++ b/net/minecraft/world/level/block/DiodeBlock.java
+@@ -57,14 +57,14 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+             boolean shouldTurnOn = this.shouldTurnOn(level, pos, state);
+             if (poweredValue && !shouldTurnOn) {
+                 // CraftBukkit start
+-                if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 15, 0).getNewCurrent() != 0) {
++                if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 15, 0) != 0) {
+                     return;
+                 }
+                 // CraftBukkit end
+                 level.setBlock(pos, state.setValue(POWERED, false), Block.UPDATE_CLIENTS);
+             } else if (!poweredValue) {
+                 // CraftBukkit start
+-                if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 0, 15).getNewCurrent() != 15) {
++                if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 0, 15) != 15) {
+                     return;
+                 }
+                 // CraftBukkit end
+diff --git a/net/minecraft/world/level/block/DoorBlock.java b/net/minecraft/world/level/block/DoorBlock.java
+index 523bab9194e6fa5145fbf31f0bee9a4792ad6315..af3176b28bf15da7cd57c78a89c088d45f814561 100644
+--- a/net/minecraft/world/level/block/DoorBlock.java
++++ b/net/minecraft/world/level/block/DoorBlock.java
+@@ -224,19 +224,31 @@ public class DoorBlock extends Block {
+     protected void neighborChanged(BlockState state, Level level, BlockPos pos, Block neighborBlock, @Nullable Orientation orientation, boolean movedByPiston) {
+         // CraftBukkit start
+         BlockPos otherHalf = pos.relative(state.getValue(DoorBlock.HALF) == DoubleBlockHalf.LOWER ? Direction.UP : Direction.DOWN);
+-        org.bukkit.block.Block bukkitBlock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+-        org.bukkit.block.Block blockTop = org.bukkit.craftbukkit.block.CraftBlock.at(level, otherHalf);
+-
+-        int power = bukkitBlock.getBlockPower();
+-        int powerTop = blockTop.getBlockPower();
+-        if (powerTop > power) power = powerTop;
+-        int oldPower = state.getValue(DoorBlock.POWERED) ? net.minecraft.world.level.redstone.Redstone.SIGNAL_MAX : net.minecraft.world.level.redstone.Redstone.SIGNAL_MIN;
+-
+-        if (oldPower == 0 ^ power == 0) {
+-            org.bukkit.event.block.BlockRedstoneEvent event = new org.bukkit.event.block.BlockRedstoneEvent(bukkitBlock, oldPower, power);
+-            event.callEvent();
++        boolean flag;
++        boolean shouldUpdate;
++        if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++            org.bukkit.block.Block bukkitBlock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++            org.bukkit.block.Block blockTop = org.bukkit.craftbukkit.block.CraftBlock.at(level, otherHalf);
++
++            int power = bukkitBlock.getBlockPower();
++            int powerTop = blockTop.getBlockPower();
++            if (powerTop > power) power = powerTop;
++            int oldPower = state.getValue(DoorBlock.POWERED) ? net.minecraft.world.level.redstone.Redstone.SIGNAL_MAX : net.minecraft.world.level.redstone.Redstone.SIGNAL_MIN;
++
++            shouldUpdate = (oldPower == 0 ^ power == 0);
++            if (shouldUpdate) {
++                org.bukkit.event.block.BlockRedstoneEvent event = new org.bukkit.event.block.BlockRedstoneEvent(bukkitBlock, oldPower, power);
++                event.callEvent();
++                flag = event.getNewCurrent() > 0;
++            } else {
++                flag = false;
++            }
++        } else {
++            flag = level.hasNeighborSignal(pos) || level.hasNeighborSignal(otherHalf);
++            shouldUpdate = flag != state.getValue(POWERED);
++        }
+ 
+-            boolean flag = event.getNewCurrent() > 0;
++        if (shouldUpdate) {
+             // CraftBukkit end
+             if (flag != state.getValue(OPEN)) {
+                 this.playSound(null, level, pos, flag);
+diff --git a/net/minecraft/world/level/block/FenceGateBlock.java b/net/minecraft/world/level/block/FenceGateBlock.java
+index 48aa8820761806f40761ab18496720af538bbd4d..c20918cbe6048fe200a58428470399b48ba33292 100644
+--- a/net/minecraft/world/level/block/FenceGateBlock.java
++++ b/net/minecraft/world/level/block/FenceGateBlock.java
+@@ -201,7 +201,7 @@ public class FenceGateBlock extends HorizontalDirectionalBlock {
+             boolean hasNeighborSignal = level.hasNeighborSignal(pos);
+             // CraftBukkit start
+             boolean oldPowered = state.getValue(FenceGateBlock.POWERED);
+-            if (oldPowered != hasNeighborSignal) {
++            if (oldPowered != hasNeighborSignal && org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
+                 int newPower = hasNeighborSignal ? 15 : 0;
+                 int oldPower = oldPowered ? 15 : 0;
+                 org.bukkit.block.Block bukkitBlock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+diff --git a/net/minecraft/world/level/block/LecternBlock.java b/net/minecraft/world/level/block/LecternBlock.java
+index 52b9bd310c731c407fc4264559084debec81d3d9..861d91b59c0ffe6628cde83c6fa82f44d5dd59a7 100644
+--- a/net/minecraft/world/level/block/LecternBlock.java
++++ b/net/minecraft/world/level/block/LecternBlock.java
+@@ -177,9 +177,7 @@ public class LecternBlock extends BaseEntityBlock {
+         // Paper start - Call BlockRedstoneEvent properly
+         final int currentRedstoneLevel = state.getValue(LecternBlock.POWERED) ? 15 : 0, targetRedstoneLevel = powered ? 15 : 0;
+         if (currentRedstoneLevel != targetRedstoneLevel) {
+-            final org.bukkit.event.block.BlockRedstoneEvent event = org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, currentRedstoneLevel, targetRedstoneLevel);
+-
+-            if (event.getNewCurrent() != targetRedstoneLevel) {
++            if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, currentRedstoneLevel, targetRedstoneLevel) != targetRedstoneLevel) {
+                 return;
+             }
+         }
+diff --git a/net/minecraft/world/level/block/LeverBlock.java b/net/minecraft/world/level/block/LeverBlock.java
+index 5f03e9fed3d4a8c3b72ca05be0b62ef45ac291f7..339ffe37d2463f097d196a25c6ee065087eb3006 100644
+--- a/net/minecraft/world/level/block/LeverBlock.java
++++ b/net/minecraft/world/level/block/LeverBlock.java
+@@ -68,16 +68,18 @@ public class LeverBlock extends FaceAttachedHorizontalDirectionalBlock {
+             }
+         } else {
+             // CraftBukkit start - Interact Lever
+-            boolean powered = state.getValue(LeverBlock.POWERED); // Old powered state
+-            org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+-            int old = (powered) ? 15 : 0;
+-            int current = (!powered) ? 15 : 0;
+-
+-            org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(block, old, current);
+-            level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+-
+-            if ((eventRedstone.getNewCurrent() > 0) != (!powered)) {
+-                return InteractionResult.SUCCESS;
++            if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++                boolean powered = state.getValue(LeverBlock.POWERED); // Old powered state
++                org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++                int old = (powered) ? 15 : 0;
++                int current = (!powered) ? 15 : 0;
++
++                org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(block, old, current);
++                level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++
++                if ((eventRedstone.getNewCurrent() > 0) != (!powered)) {
++                    return InteractionResult.SUCCESS;
++                }
+             }
+             // CraftBukkit end
+             this.pull(state, level, pos, null);
+diff --git a/net/minecraft/world/level/block/LightningRodBlock.java b/net/minecraft/world/level/block/LightningRodBlock.java
+index 622f28a3661eec0487179aa9798f5771c0d957f7..d06ab36887c8e130742633b9e3ad494410678b36 100644
+--- a/net/minecraft/world/level/block/LightningRodBlock.java
++++ b/net/minecraft/world/level/block/LightningRodBlock.java
+@@ -83,15 +83,17 @@ public class LightningRodBlock extends RodBlock implements SimpleWaterloggedBloc
+ 
+     public void onLightningStrike(BlockState state, Level level, BlockPos pos) {
+         // CraftBukkit start
+-        boolean powered = state.getValue(LightningRodBlock.POWERED);
+-        int old = (powered) ? 15 : 0;
+-        int current = (!powered) ? 15 : 0;
++        if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++            boolean powered = state.getValue(LightningRodBlock.POWERED);
++            int old = (powered) ? 15 : 0;
++            int current = (!powered) ? 15 : 0;
+ 
+-        org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), old, current);
+-        level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++            org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), old, current);
++            level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+ 
+-        if (eventRedstone.getNewCurrent() <= 0) {
+-            return;
++            if (eventRedstone.getNewCurrent() <= 0) {
++                return;
++            }
+         }
+         // CraftBukkit end
+         level.setBlock(pos, state.setValue(POWERED, true), Block.UPDATE_ALL);
+diff --git a/net/minecraft/world/level/block/ObserverBlock.java b/net/minecraft/world/level/block/ObserverBlock.java
+index df0a900c249f0fd778287d055a5ad92787c7ceb5..7e3cbda8b248cda2fd80deec267b52490f0f30f6 100644
+--- a/net/minecraft/world/level/block/ObserverBlock.java
++++ b/net/minecraft/world/level/block/ObserverBlock.java
+@@ -51,14 +51,14 @@ public class ObserverBlock extends DirectionalBlock {
+     protected void tick(BlockState state, ServerLevel level, BlockPos pos, RandomSource random) {
+         if (state.getValue(POWERED)) {
+             // CraftBukkit start
+-            if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 15, 0).getNewCurrent() != 0) {
++            if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 15, 0) != 0) {
+                 return;
+             }
+             // CraftBukkit end
+             level.setBlock(pos, state.setValue(POWERED, false), Block.UPDATE_CLIENTS);
+         } else {
+             // CraftBukkit start
+-            if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 0, 15).getNewCurrent() != 15) {
++            if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 0, 15) != 15) {
+                 return;
+             }
+             // CraftBukkit end
+diff --git a/net/minecraft/world/level/block/PoweredRailBlock.java b/net/minecraft/world/level/block/PoweredRailBlock.java
+index b455d7193ece81af8d9197adb91c5aa896b607b4..480bc2698faef7cd529cde98958b12b4a44c0806 100644
+--- a/net/minecraft/world/level/block/PoweredRailBlock.java
++++ b/net/minecraft/world/level/block/PoweredRailBlock.java
+@@ -135,7 +135,7 @@ public class PoweredRailBlock extends BaseRailBlock {
+         if (flag != poweredValue) {
+             // CraftBukkit start
+             int power = flag ? 15 : 0;
+-            int newPower = org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, power, 15 - power).getNewCurrent();
++            int newPower = org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, power, 15 - power);
+             if (newPower == power) {
+                 return;
+             }
+diff --git a/net/minecraft/world/level/block/RedStoneWireBlock.java b/net/minecraft/world/level/block/RedStoneWireBlock.java
+index a48b7ead585f0a1d0d5420914a7bb3d511d367ff..e07867f9d5f7ae3973903eb589ef68f8c950811d 100644
+--- a/net/minecraft/world/level/block/RedStoneWireBlock.java
++++ b/net/minecraft/world/level/block/RedStoneWireBlock.java
+@@ -307,10 +307,12 @@ public class RedStoneWireBlock extends Block {
+         int oldPower = state.getValue(POWER);
+         int newPower = ((DefaultRedstoneWireEvaluator) evaluator).calculateTargetStrength(level, pos);
+         if (oldPower != newPower) {
+-            org.bukkit.event.block.BlockRedstoneEvent event = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), oldPower, newPower);
+-            level.getCraftServer().getPluginManager().callEvent(event);
++            if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++                org.bukkit.event.block.BlockRedstoneEvent event = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), oldPower, newPower);
++                level.getCraftServer().getPluginManager().callEvent(event);
+ 
+-            newPower = event.getNewCurrent();
++                newPower = event.getNewCurrent();
++            }
+ 
+             if (level.getBlockState(pos) == state) {
+                 state = state.setValue(POWER, newPower);
+diff --git a/net/minecraft/world/level/block/RedstoneLampBlock.java b/net/minecraft/world/level/block/RedstoneLampBlock.java
+index 5d56412d616eaaadd4d98ac1e94c8f554e7a4232..9fd827e74ec2037a7aae1adc083533d4de7d2be4 100644
+--- a/net/minecraft/world/level/block/RedstoneLampBlock.java
++++ b/net/minecraft/world/level/block/RedstoneLampBlock.java
+@@ -41,7 +41,7 @@ public class RedstoneLampBlock extends Block {
+                     level.scheduleTick(pos, this, 4);
+                 } else {
+                     // CraftBukkit start
+-                    if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 0, 15).getNewCurrent() != 15) {
++                    if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 0, 15) != 15) {
+                         return;
+                     }
+                     // CraftBukkit end
+@@ -55,7 +55,7 @@ public class RedstoneLampBlock extends Block {
+     protected void tick(BlockState state, ServerLevel level, BlockPos pos, RandomSource random) {
+         if (state.getValue(LIT) && !level.hasNeighborSignal(pos)) {
+             // CraftBukkit start
+-            if (org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(level, pos, 15, 0).getNewCurrent() != 0) {
++            if (org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, 15, 0) != 0) {
+                 return;
+             }
+             // CraftBukkit end
+diff --git a/net/minecraft/world/level/block/RedstoneTorchBlock.java b/net/minecraft/world/level/block/RedstoneTorchBlock.java
+index 17715d23610ace2c4051277d02e405e079387f51..8ba2fd3cb2acad31f3d85532dd28bfa827d7a040 100644
+--- a/net/minecraft/world/level/block/RedstoneTorchBlock.java
++++ b/net/minecraft/world/level/block/RedstoneTorchBlock.java
+@@ -83,21 +83,13 @@ public class RedstoneTorchBlock extends BaseTorchBlock {
+         // Paper end - Faster redstone torch rapid clock removal
+ 
+         // CraftBukkit start
+-        org.bukkit.plugin.PluginManager manager = level.getCraftServer().getPluginManager();
+-        org.bukkit.block.Block block = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+         int oldCurrent = state.getValue(LIT) ? 15 : 0;
+-
+-        org.bukkit.event.block.BlockRedstoneEvent event = new org.bukkit.event.block.BlockRedstoneEvent(block, oldCurrent, oldCurrent);
+         // CraftBukkit end
+         if (state.getValue(LIT)) {
+             if (hasNeighborSignal) {
+                 // CraftBukkit start
+-                if (oldCurrent != 0) {
+-                    event.setNewCurrent(0);
+-                    manager.callEvent(event);
+-                    if (event.getNewCurrent() != 0) {
+-                        return;
+-                    }
++                if (oldCurrent != 0 && org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, oldCurrent, 0) != 0) {
++                    return;
+                 }
+                 // CraftBukkit end
+                 level.setBlock(pos, state.setValue(LIT, false), Block.UPDATE_ALL);
+@@ -108,12 +100,8 @@ public class RedstoneTorchBlock extends BaseTorchBlock {
+             }
+         } else if (!hasNeighborSignal && !isToggledTooFrequently(level, pos, false)) {
+             // CraftBukkit start
+-            if (oldCurrent != 15) {
+-                event.setNewCurrent(15);
+-                manager.callEvent(event);
+-                if (event.getNewCurrent() != 15) {
+-                    return;
+-                }
++            if (oldCurrent != 15 && org.dreeam.leaf.util.RedstoneEventHelper.callRedstoneChange(level, pos, oldCurrent, 15) != 15) {
++                return;
+             }
+             // CraftBukkit end
+             level.setBlock(pos, state.setValue(LIT, true), Block.UPDATE_ALL);
+diff --git a/net/minecraft/world/level/block/SculkSensorBlock.java b/net/minecraft/world/level/block/SculkSensorBlock.java
+index c8d27c4848efa2dcb988eded8b80b526565a16ac..85ada4fc5a160963129e4884e7af8c6ec9752202 100644
+--- a/net/minecraft/world/level/block/SculkSensorBlock.java
++++ b/net/minecraft/world/level/block/SculkSensorBlock.java
+@@ -215,12 +215,14 @@ public class SculkSensorBlock extends BaseEntityBlock implements SimpleWaterlogg
+ 
+     public static void deactivate(Level level, BlockPos pos, BlockState state) {
+         // CraftBukkit start
+-        org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), state.getValue(SculkSensorBlock.POWER), 0);
+-        level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++        if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++            org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), state.getValue(SculkSensorBlock.POWER), 0);
++            level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+ 
+-        if (eventRedstone.getNewCurrent() > 0) {
+-            level.setBlock(pos, state.setValue(SculkSensorBlock.POWER, eventRedstone.getNewCurrent()), Block.UPDATE_ALL);
+-            return;
++            if (eventRedstone.getNewCurrent() > 0) {
++                level.setBlock(pos, state.setValue(SculkSensorBlock.POWER, eventRedstone.getNewCurrent()), Block.UPDATE_ALL);
++                return;
++            }
+         }
+         // CraftBukkit end
+         level.setBlock(pos, state.setValue(PHASE, SculkSensorPhase.COOLDOWN).setValue(POWER, 0), Block.UPDATE_ALL);
+@@ -235,13 +237,17 @@ public class SculkSensorBlock extends BaseEntityBlock implements SimpleWaterlogg
+ 
+     public void activate(@Nullable Entity entity, Level level, BlockPos pos, BlockState state, int power, int frequency) {
+         // CraftBukkit start
+-        org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), state.getValue(SculkSensorBlock.POWER), power);
+-        level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++        if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++            org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), state.getValue(SculkSensorBlock.POWER), power);
++            level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+ 
+-        if (eventRedstone.getNewCurrent() <= 0) {
++            if (eventRedstone.getNewCurrent() <= 0) {
++                return;
++            }
++            power = eventRedstone.getNewCurrent();
++        } else if (power <= 0) {
+             return;
+         }
+-        power = eventRedstone.getNewCurrent();
+         // CraftBukkit end
+         level.setBlock(pos, state.setValue(PHASE, SculkSensorPhase.ACTIVE).setValue(POWER, power), Block.UPDATE_ALL);
+         level.scheduleTick(pos, state.getBlock(), this.getActiveTicks());
+diff --git a/net/minecraft/world/level/block/ShelfBlock.java b/net/minecraft/world/level/block/ShelfBlock.java
+index 235a01fd28999cae9dd5ba7aa8f18096c89d32f5..12a998dcd8e207d1c226e65dea3967b9e8bfb6ec 100644
+--- a/net/minecraft/world/level/block/ShelfBlock.java
++++ b/net/minecraft/world/level/block/ShelfBlock.java
+@@ -110,7 +110,7 @@ public class ShelfBlock extends BaseEntityBlock implements SelectableSlotContain
+             boolean hasNeighborSignal = level.hasNeighborSignal(pos);
+             if (state.getValue(POWERED) != hasNeighborSignal) {
+                 // Paper start - Call BlockRedstoneEvent
+-                if (!org.bukkit.craftbukkit.event.CraftEventFactory.callBinaryRedstoneChange(level, pos, hasNeighborSignal)) {
++                if (!org.dreeam.leaf.util.RedstoneEventHelper.callBinaryRedstoneChange(level, pos, hasNeighborSignal)) {
+                     return;
+                 }
+                 // Paper end - Call BlockRedstoneEvent
+diff --git a/net/minecraft/world/level/block/TrapDoorBlock.java b/net/minecraft/world/level/block/TrapDoorBlock.java
+index b45ae50db32c4156b8f8008335673d20c570c72d..4152c59ac634a6281e5d470db9d1ea90c9efb9f6 100644
+--- a/net/minecraft/world/level/block/TrapDoorBlock.java
++++ b/net/minecraft/world/level/block/TrapDoorBlock.java
+@@ -129,14 +129,16 @@ public class TrapDoorBlock extends HorizontalDirectionalBlock implements SimpleW
+             boolean hasNeighborSignal = level.hasNeighborSignal(pos);
+             if (hasNeighborSignal != state.getValue(POWERED)) {
+                 // CraftBukkit start
+-                org.bukkit.block.Block bblock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+-                int power = bblock.getBlockPower();
+-                int oldPower = state.getValue(TrapDoorBlock.OPEN) ? 15 : 0;
+-
+-                if (oldPower == 0 ^ power == 0 || neighborBlock.defaultBlockState().isSignalSource()) {
+-                    org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(bblock, oldPower, power);
+-                    level.getCraftServer().getPluginManager().callEvent(eventRedstone);
+-                    hasNeighborSignal = eventRedstone.getNewCurrent() > 0;
++                if (org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
++                    org.bukkit.block.Block bblock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++                    int power = bblock.getBlockPower();
++                    int oldPower = state.getValue(TrapDoorBlock.OPEN) ? 15 : 0;
++
++                    if (oldPower == 0 ^ power == 0 || neighborBlock.defaultBlockState().isSignalSource()) {
++                        org.bukkit.event.block.BlockRedstoneEvent eventRedstone = new org.bukkit.event.block.BlockRedstoneEvent(bblock, oldPower, power);
++                        level.getCraftServer().getPluginManager().callEvent(eventRedstone);
++                        hasNeighborSignal = eventRedstone.getNewCurrent() > 0;
++                    }
+                 }
+                 // CraftBukkit end
+                 // Paper start - break redstone on trapdoors early
+diff --git a/net/minecraft/world/level/block/TripWireHookBlock.java b/net/minecraft/world/level/block/TripWireHookBlock.java
+index 5f5833caf84428fc2666bc1c0f8c860ffa0cae59..18f60d473559c5920dcafc4e3f2269ff6efe4dc4 100644
+--- a/net/minecraft/world/level/block/TripWireHookBlock.java
++++ b/net/minecraft/world/level/block/TripWireHookBlock.java
+@@ -156,7 +156,7 @@ public class TripWireHookBlock extends Block {
+             if (i > 0) {
+                 BlockPos blockPosx = pos.relative(direction, i);
+                 // Paper start - Call BlockRedstoneEvent
+-                if (wasPowered != willBePowered) {
++                if (wasPowered != willBePowered && org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
+                     int newCurrent = willBePowered ? 15 : 0;
+                     org.bukkit.event.block.BlockRedstoneEvent event = new org.bukkit.event.block.BlockRedstoneEvent(
+                         org.bukkit.craftbukkit.block.CraftBlock.at(level, blockPosx), wasPowered ? 15 : 0, newCurrent
+@@ -173,7 +173,7 @@ public class TripWireHookBlock extends Block {
+                 } // Paper - Call BlockRedstoneEvent
+             }
+             // Paper start - Call BlockRedstoneEvent
+-            if (wasPowered != willBePowered) {
++            if (wasPowered != willBePowered && org.dreeam.leaf.util.RedstoneEventHelper.hasListeners()) {
+                 int newCurrent = willBePowered ? 15 : 0;
+                 org.bukkit.event.block.BlockRedstoneEvent event = new org.bukkit.event.block.BlockRedstoneEvent(
+                     org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), wasPowered ? 15 : 0, newCurrent
+diff --git a/net/minecraft/world/level/block/piston/PistonBaseBlock.java b/net/minecraft/world/level/block/piston/PistonBaseBlock.java
+index 1576f07cbb3708c9878dcf81d331a04ec0e0d9ce..172c1368b32c461f3a19be66d06e209c32729b3f 100644
+--- a/net/minecraft/world/level/block/piston/PistonBaseBlock.java
++++ b/net/minecraft/world/level/block/piston/PistonBaseBlock.java
+@@ -190,7 +190,7 @@ public class PistonBaseBlock extends DirectionalBlock {
+                 .setValue(MovingPistonBlock.FACING, direction)
+                 .setValue(MovingPistonBlock.TYPE, this.isSticky ? PistonType.STICKY : PistonType.DEFAULT);
+             // Paper start - Fix sticky pistons and BlockPistonRetractEvent; Move empty piston retract call to fix multiple event fires
+-            if (!this.isSticky) {
++            if (!this.isSticky && org.bukkit.event.block.BlockPistonRetractEvent.getHandlerList().getRegisteredListeners().length != 0) {
+                 if (!new org.bukkit.event.block.BlockPistonRetractEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), java.util.Collections.emptyList(), org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(direction)).callEvent()) {
+                     return false;
+                 }
+@@ -224,7 +224,7 @@ public class PistonBaseBlock extends DirectionalBlock {
+                             && !blockState2.is(Blocks.PISTON)
+                             && !blockState2.is(Blocks.STICKY_PISTON)) {
+                         // Paper start - Fix sticky pistons and BlockPistonRetractEvent; fire BlockPistonRetractEvent for sticky pistons retracting nothing (air)
+-                        if (id == TRIGGER_CONTRACT && blockState1.isAir()) {
++                        if (id == TRIGGER_CONTRACT && blockState1.isAir() && org.bukkit.event.block.BlockPistonRetractEvent.getHandlerList().getRegisteredListeners().length != 0) {
+                             if (!new org.bukkit.event.block.BlockPistonRetractEvent(org.bukkit.craftbukkit.block.CraftBlock.at(level, pos), java.util.Collections.emptyList(), org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(direction)).callEvent()) {
+                                 return false;
+                             }
+@@ -311,45 +311,50 @@ public class PistonBaseBlock extends DirectionalBlock {
+             Direction direction = extending ? facing : facing.getOpposite();
+             int i = 0;
+             // CraftBukkit start
+-            final org.bukkit.block.Block bukkitBlock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++            final boolean hasPistonListeners = extending
++                ? org.bukkit.event.block.BlockPistonExtendEvent.getHandlerList().getRegisteredListeners().length != 0
++                : org.bukkit.event.block.BlockPistonRetractEvent.getHandlerList().getRegisteredListeners().length != 0;
++            if (hasPistonListeners) {
++                final org.bukkit.block.Block bukkitBlock = org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+ 
+-            final List<BlockPos> moved = pistonStructureResolver.getToPush();
+-            final List<BlockPos> broken = pistonStructureResolver.getToDestroy();
++                final List<BlockPos> moved = pistonStructureResolver.getToPush();
++                final List<BlockPos> broken = pistonStructureResolver.getToDestroy();
+ 
+-            List<org.bukkit.block.Block> blocks = new java.util.AbstractList<>() {
++                List<org.bukkit.block.Block> blocks = new java.util.AbstractList<>() {
+ 
+-                @Override
+-                public int size() {
+-                    return moved.size() + broken.size();
+-                }
+-
+-                @Override
+-                public org.bukkit.block.Block get(int index) {
+-                    if (index >= this.size() || index < 0) {
+-                        throw new ArrayIndexOutOfBoundsException(index);
++                    @Override
++                    public int size() {
++                        return moved.size() + broken.size();
+                     }
+ 
+-                    BlockPos pos = index < moved.size() ? moved.get(index) : broken.get(index - moved.size());
+-                    return org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
+-                }
+-            };
++                    @Override
++                    public org.bukkit.block.Block get(int index) {
++                        if (index >= this.size() || index < 0) {
++                            throw new ArrayIndexOutOfBoundsException(index);
++                        }
+ 
+-            final org.bukkit.event.block.BlockPistonEvent event;
+-            if (extending) {
+-                event = new org.bukkit.event.block.BlockPistonExtendEvent(bukkitBlock, blocks, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(direction));
+-            } else {
+-                event = new org.bukkit.event.block.BlockPistonRetractEvent(bukkitBlock, blocks, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(direction));
+-            }
+-            if (!event.callEvent()) {
+-                for (BlockPos brokenPos : broken) {
+-                    level.sendBlockUpdated(brokenPos, Blocks.AIR.defaultBlockState(), level.getBlockState(brokenPos), Block.UPDATE_ALL);
++                        BlockPos pos = index < moved.size() ? moved.get(index) : broken.get(index - moved.size());
++                        return org.bukkit.craftbukkit.block.CraftBlock.at(level, pos);
++                    }
++                };
++
++                final org.bukkit.event.block.BlockPistonEvent event;
++                if (extending) {
++                    event = new org.bukkit.event.block.BlockPistonExtendEvent(bukkitBlock, blocks, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(direction));
++                } else {
++                    event = new org.bukkit.event.block.BlockPistonRetractEvent(bukkitBlock, blocks, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(direction));
+                 }
+-                for (BlockPos movedPos : moved) {
+-                    level.sendBlockUpdated(movedPos, Blocks.AIR.defaultBlockState(), level.getBlockState(movedPos), Block.UPDATE_ALL);
+-                    movedPos = movedPos.relative(direction);
+-                    level.sendBlockUpdated(movedPos, Blocks.AIR.defaultBlockState(), level.getBlockState(movedPos), Block.UPDATE_ALL);
++                if (!event.callEvent()) {
++                    for (BlockPos brokenPos : broken) {
++                        level.sendBlockUpdated(brokenPos, Blocks.AIR.defaultBlockState(), level.getBlockState(brokenPos), Block.UPDATE_ALL);
++                    }
++                    for (BlockPos movedPos : moved) {
++                        level.sendBlockUpdated(movedPos, Blocks.AIR.defaultBlockState(), level.getBlockState(movedPos), Block.UPDATE_ALL);
++                        movedPos = movedPos.relative(direction);
++                        level.sendBlockUpdated(movedPos, Blocks.AIR.defaultBlockState(), level.getBlockState(movedPos), Block.UPDATE_ALL);
++                    }
++                    return false;
+                 }
+-                return false;
+             }
+             // CraftBukkit end
+ 
+diff --git a/net/minecraft/world/level/block/piston/PistonMovingBlockEntity.java b/net/minecraft/world/level/block/piston/PistonMovingBlockEntity.java
+index bc42a6c678987a39b0a70a1a3e96eb90340ffea5..9aea7edbff9f8a674cee2388974b42fe67fcecf1 100644
+--- a/net/minecraft/world/level/block/piston/PistonMovingBlockEntity.java
++++ b/net/minecraft/world/level/block/piston/PistonMovingBlockEntity.java
+@@ -110,8 +110,44 @@ public class PistonMovingBlockEntity extends BlockEntity {
+             : this.movedState;
+     }
+ 
++    private static boolean hasPotentialPistonEntities(final Level level, final BlockPos pos, final Direction movementDirection, final boolean sticky) {
++        if (!(level instanceof net.minecraft.server.level.ServerLevel serverLevel)) {
++            return true;
++        }
++        final int px = pos.getX();
++        final int py = pos.getY();
++        final int pz = pos.getZ();
++
++        // Cover piston start/end swept box ([px - 1 .. px + 2], +3/+4 height for honey) plus Moonrise +-2 entity search margin
++        final int minChunkX = (px - 3) >> 4;
++        final int maxChunkX = (px + 4) >> 4;
++        final int minChunkZ = (pz - 3) >> 4;
++        final int maxChunkZ = (pz + 4) >> 4;
++        final int minSecY = (py - 3) >> 4;
++        final int maxSecY = (py + (sticky ? 5 : 4)) >> 4;
++
++        final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup lookup = serverLevel.moonrise$getEntityLookup();
++        for (int cz = minChunkZ; cz <= maxChunkZ; ++cz) {
++            for (int cx = minChunkX; cx <= maxChunkX; ++cx) {
++                final ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices slices = lookup.getChunk(cx, cz);
++                if (slices == null || slices.isEmpty()) {
++                    continue;
++                }
++                for (int sy = minSecY; sy <= maxSecY; ++sy) {
++                    if (slices.hasEntitiesInSection(sy)) {
++                        return true;
++                    }
++                }
++            }
++        }
++        return false;
++    }
++
+     private static void moveCollidedEntities(Level level, BlockPos pos, float partialTick, PistonMovingBlockEntity piston) {
+         Direction movementDirection = piston.getMovementDirection();
++        if (!hasPotentialPistonEntities(level, pos, movementDirection, false)) {
++            return;
++        }
+         double d = partialTick - piston.progress;
+         VoxelShape collisionShape = piston.getCollisionRelatedBlockState().getCollisionShape(level, pos);
+         if (!collisionShape.isEmpty()) {
+@@ -199,6 +235,9 @@ public class PistonMovingBlockEntity extends BlockEntity {
+         if (piston.isStickyForEntities()) {
+             Direction movementDirection = piston.getMovementDirection();
+             if (movementDirection.getAxis().isHorizontal()) {
++                if (!hasPotentialPistonEntities(level, pos, movementDirection, true)) {
++                    return;
++                }
+                 double d = piston.movedState.getCollisionShape(level, pos).max(Direction.Axis.Y);
+                 AABB aabb = moveByPositionAndProgress(pos, new AABB(0.0, d, 0.0, 1.0, 1.5000010000000001, 1.0), piston);
+                 double d1 = partialTick - piston.progress;
+diff --git a/net/minecraft/world/level/block/state/BlockBehaviour.java b/net/minecraft/world/level/block/state/BlockBehaviour.java
+index 1b01cc3b245fb08d8bc34789aeca596c56727e15..775bd18fcd01d1d354a1acb992214e56223ec831 100644
+--- a/net/minecraft/world/level/block/state/BlockBehaviour.java
++++ b/net/minecraft/world/level/block/state/BlockBehaviour.java
+@@ -476,6 +476,24 @@ public abstract class BlockBehaviour implements FeatureElement, net.caffeinemc.m
+         public int tagFlag; // Leaf - Cache block state tags
+         public net.minecraft.core.@Nullable Holder<net.minecraft.world.entity.ai.village.poi.PoiType> leaf$poiType; // Leaf - O(1) PoiType lookup
+         public java.util.Optional<net.minecraft.core.Holder<net.minecraft.world.entity.ai.village.poi.PoiType>> leaf$poiTypeOptional = java.util.Optional.empty(); // Leaf - O(1) PoiType lookup
++        public boolean leaf$hasInsideBlockEffect; // Leaf - Cache whether block has inside-block or fluid effects
++
++        private static final ClassValue<Boolean> ENTITY_INSIDE_OVERRIDE_CACHE = new ClassValue<>() {
++            @Override
++            protected Boolean computeValue(Class<?> type) {
++                for (Class<?> cls = type; cls != null && cls != BlockBehaviour.class && cls != Object.class; cls = cls.getSuperclass()) {
++                    try {
++                        cls.getDeclaredMethod(
++                            "entityInside",
++                            BlockState.class, Level.class, BlockPos.class, Entity.class, net.minecraft.world.entity.InsideBlockEffectApplier.class, boolean.class
++                        );
++                        return Boolean.TRUE;
++                    } catch (NoSuchMethodException ignored) {
++                    }
++                }
++                return Boolean.FALSE;
++            }
++        };
+ 
+         private static void initCaches(final VoxelShape shape, final boolean neighbours) {
+             ((ca.spottedleaf.moonrise.patches.collisions.shape.CollisionVoxelShape)shape).moonrise$isFullBlock();
+@@ -582,6 +600,7 @@ public abstract class BlockBehaviour implements FeatureElement, net.caffeinemc.m
+         protected boolean shapeExceedsCube = true; // Paper - moved from actual method to here
+         public void initCache() {
+             this.fluidState = this.owner.getFluidState(this.asState());
++            this.leaf$hasInsideBlockEffect = !this.fluidState.isEmpty() || ENTITY_INSIDE_OVERRIDE_CACHE.get(this.owner.getClass());
+             this.isRandomlyTicking = this.owner.isRandomlyTicking(this.asState());
+             if (!this.getBlock().hasDynamicShape()) {
+                 this.cache = new BlockBehaviour.BlockStateBase.Cache(this.asState());
+diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
+index b2157681449f1fc5461ac3f7ccb91c61043416ab..f97d6d70fcc301921adcec28d41f32a6c28deea4 100644
+--- a/net/minecraft/world/level/chunk/LevelChunkSection.java
++++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
+@@ -183,6 +183,8 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+ 
+     public boolean hasFluid() { return this.fluidCount > 0; } // Leaf - counting chunk section fluid
+ 
++    public boolean hasFluids() { return this.fluidCount > 0; } // Leaf - section-level fluid short-circuit
++
+     public boolean isRandomlyTicking() {
+         return this.isRandomlyTickingBlocks() || this.isRandomlyTickingFluids();
+     }
+diff --git a/net/minecraft/world/level/storage/LevelStorageSource.java b/net/minecraft/world/level/storage/LevelStorageSource.java
+index 79161b738daa7898ff25d8cce0e1efae864aecdf..b38a02fc1cc1db46787aac13939fa524753544d0 100644
+--- a/net/minecraft/world/level/storage/LevelStorageSource.java
++++ b/net/minecraft/world/level/storage/LevelStorageSource.java
+@@ -517,16 +517,11 @@ public class LevelStorageSource {
+             Path path = this.levelDirectory.path();
+ 
+             // Leaf start - Async playerdata saving
+-            // Save level.dat asynchronously
+-            var nbtBytes = new it.unimi.dsi.fastutil.io.FastByteArrayOutputStream(65536);
+-            try {
+-                NbtIo.writeCompressed(tag, nbtBytes);
+-            } catch (Exception var6) {
+-                LevelStorageSource.LOGGER.error("Failed to encode level {}", path, var6);
+-                return;
+-            }
++            // Compress and save level.dat asynchronously
+             org.dreeam.leaf.async.AsyncPlayerDataSaving.submitLevelSave(() -> {
+                 try {
++                    var nbtBytes = new it.unimi.dsi.fastutil.io.FastByteArrayOutputStream(65536);
++                    NbtIo.writeCompressed(tag, nbtBytes);
+                     Path path1 = Files.createTempFile(path, "level", ".dat");
+                     org.apache.commons.io.FileUtils.writeByteArrayToFile(path1.toFile(), nbtBytes.array, 0, nbtBytes.length, false);
+                     Path path2 = this.levelDirectory.oldDataFile();
+diff --git a/net/minecraft/world/level/storage/PrimaryLevelData.java b/net/minecraft/world/level/storage/PrimaryLevelData.java
+index 8936b4b1ae9c82eed2a7d3191a29f01792438d14..3d21bc909be470606bf0f735eb55c650bf467c4b 100644
+--- a/net/minecraft/world/level/storage/PrimaryLevelData.java
++++ b/net/minecraft/world/level/storage/PrimaryLevelData.java
+@@ -65,6 +65,8 @@ public class PrimaryLevelData implements ServerLevelData, WorldData {
+     private Optional<WorldBorder.Settings> legacyWorldBorderSettings;
+     private EndDragonFight.Data endDragonFightData;
+     private @Nullable CompoundTag customBossEvents;
++    private @Nullable Tag cachedWorldGenSettingsTag; // Leaf - Cache serialized WorldGenSettings tag
++    private @Nullable Object cachedWorldGenSource; // Leaf - Cache serialized WorldGenSettings tag
+     private int wanderingTraderSpawnDelay;
+     private int wanderingTraderSpawnChance;
+     private @Nullable UUID wanderingTraderId;
+@@ -253,10 +255,21 @@ public class PrimaryLevelData implements ServerLevelData, WorldData {
+         compoundTag.putString("Series", SharedConstants.getCurrentVersion().dataVersion().series());
+         tag.put("Version", compoundTag);
+         NbtUtils.addCurrentDataVersion(tag);
+-        DynamicOps<Tag> dynamicOps = registry.createSerializationContext(NbtOps.INSTANCE);
+-        WorldGenSettings.encode(dynamicOps, this.worldOptions, new net.minecraft.world.level.levelgen.WorldDimensions(this.customDimensions != null ? this.customDimensions : registry.lookupOrThrow(net.minecraft.core.registries.Registries.LEVEL_STEM))) // CraftBukkit
+-            .resultOrPartial(Util.prefix("WorldGenSettings: ", LOGGER::error))
+-            .ifPresent(worldOptionsTag -> tag.put("WorldGenSettings", worldOptionsTag));
++        // Leaf start - Cache serialized WorldGenSettings tag
++        final Object dimSource = this.customDimensions != null ? this.customDimensions : registry;
++        if (this.cachedWorldGenSettingsTag == null || this.cachedWorldGenSource != dimSource) {
++            DynamicOps<Tag> dynamicOps = registry.createSerializationContext(NbtOps.INSTANCE);
++            WorldGenSettings.encode(dynamicOps, this.worldOptions, new net.minecraft.world.level.levelgen.WorldDimensions(this.customDimensions != null ? this.customDimensions : registry.lookupOrThrow(net.minecraft.core.registries.Registries.LEVEL_STEM))) // CraftBukkit
++                .resultOrPartial(Util.prefix("WorldGenSettings: ", LOGGER::error))
++                .ifPresent(worldOptionsTag -> {
++                    this.cachedWorldGenSettingsTag = worldOptionsTag;
++                    this.cachedWorldGenSource = dimSource;
++                });
++        }
++        if (this.cachedWorldGenSettingsTag != null) {
++            tag.put("WorldGenSettings", this.cachedWorldGenSettingsTag.copy());
++        }
++        // Leaf end - Cache serialized WorldGenSettings tag
+         tag.putInt("GameType", this.settings.gameType().getId());
+         tag.store("spawn", LevelData.RespawnData.CODEC, this.respawnData);
+         tag.store(PAPER_RESPAWN_DIMENSION, net.minecraft.world.level.Level.RESOURCE_KEY_CODEC, this.respawnDimension); // Paper
+@@ -284,7 +297,7 @@ public class PrimaryLevelData implements ServerLevelData, WorldData {
+ 
+         tag.store(WorldDataConfiguration.MAP_CODEC, this.settings.getDataConfiguration());
+         if (this.customBossEvents != null) {
+-            tag.put("CustomBossEvents", this.customBossEvents);
++            tag.put("CustomBossEvents", this.customBossEvents.copy());
+         }
+ 
+         tag.put("ScheduledEvents", this.scheduledEvents.store());
+diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
+index 88dca66f253240c194c1b7427cd6fd4754111872..070065812b980704755b7c41f04a5bc38a9cded0 100644
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -36,6 +36,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+     private final Long2LongMap nextTickForContainer = Util.make(new Long2LongOpenHashMap(), map -> map.defaultReturnValue(Long.MAX_VALUE));
+     private final Queue<LevelChunkTicks<T>> containersToTick = new PriorityQueue<>(CONTAINER_DRAIN_ORDER);
+     private final Queue<ScheduledTick<T>> toRunThisTick = new ArrayDeque<>();
++    private final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap drainedPerChunk = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(); // Leaf - Per-chunk scheduled tick fairness
+     private final List<ScheduledTick<T>> alreadyRunThisTick = new ArrayList<>();
+     private final Set<ScheduledTick<?>> toRunThisTickSet = new ObjectOpenCustomHashSet<>(ScheduledTick.UNIQUE_TICK_HASH);
+     private final BiConsumer<LevelChunkTicks<T>, ScheduledTick<T>> chunkScheduleUpdater = (levelChunkTicks, scheduledTick) -> {
+@@ -125,20 +126,44 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+     }
+ 
+     private void drainContainers(long gameTime, int maxAllowedTicks) {
++        // Leaf start - Per-chunk scheduled tick fairness
++        final int maxPerChunk = org.dreeam.leaf.config.modules.opt.ScheduledTicksConfig.maxScheduledTicksPerChunkPerTick;
++        final boolean limitPerChunk = maxPerChunk > 0;
++        if (!this.drainedPerChunk.isEmpty()) {
++            this.drainedPerChunk.clear();
++        }
+         LevelChunkTicks<T> levelChunkTicks;
+         while (this.canScheduleMoreTicks(maxAllowedTicks) && (levelChunkTicks = this.containersToTick.poll()) != null) {
+             ScheduledTick<T> scheduledTick = levelChunkTicks.poll();
++            if (scheduledTick == null) {
++                continue;
++            }
++            final long chunkKey = limitPerChunk ? ChunkPos.asLong(scheduledTick.pos()) : 0L;
++            int drainedInChunk = limitPerChunk ? this.drainedPerChunk.get(chunkKey) : 0;
+             this.scheduleForThisTick(scheduledTick);
+-            this.drainFromCurrentContainer(this.containersToTick, levelChunkTicks, gameTime, maxAllowedTicks);
++            drainedInChunk++;
++            if (!limitPerChunk || drainedInChunk < maxPerChunk) {
++                drainedInChunk += this.drainFromCurrentContainer(
++                    this.containersToTick,
++                    levelChunkTicks,
++                    gameTime,
++                    maxAllowedTicks,
++                    limitPerChunk ? (maxPerChunk - drainedInChunk) : Integer.MAX_VALUE
++                );
++            }
++            if (limitPerChunk) {
++                this.drainedPerChunk.put(chunkKey, drainedInChunk);
++            }
+             ScheduledTick<T> scheduledTick1 = levelChunkTicks.peek();
+             if (scheduledTick1 != null) {
+-                if (scheduledTick1.triggerTick() <= gameTime && this.canScheduleMoreTicks(maxAllowedTicks)) {
++                if (scheduledTick1.triggerTick() <= gameTime && this.canScheduleMoreTicks(maxAllowedTicks) && (!limitPerChunk || drainedInChunk < maxPerChunk)) {
+                     this.containersToTick.add(levelChunkTicks);
+                 } else {
+                     this.updateContainerScheduling(scheduledTick1);
+                 }
+             }
+         }
++        // Leaf end - Per-chunk scheduled tick fairness
+     }
+ 
+     private void rescheduleLeftoverContainers() {
+@@ -151,12 +176,13 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         this.nextTickForContainer.put(ChunkPos.asLong(tick.pos()), tick.triggerTick());
+     }
+ 
+-    private void drainFromCurrentContainer(Queue<LevelChunkTicks<T>> containersToTick, LevelChunkTicks<T> levelChunkTicks, long gameTime, int maxAllowedTicks) {
+-        if (this.canScheduleMoreTicks(maxAllowedTicks)) {
++    private int drainFromCurrentContainer(Queue<LevelChunkTicks<T>> containersToTick, LevelChunkTicks<T> levelChunkTicks, long gameTime, int maxAllowedTicks, int maxRemainingForChunk) {
++        int drained = 0;
++        if (this.canScheduleMoreTicks(maxAllowedTicks) && maxRemainingForChunk > 0) {
+             LevelChunkTicks<T> levelChunkTicks1 = containersToTick.peek();
+             ScheduledTick<T> scheduledTick = levelChunkTicks1 != null ? levelChunkTicks1.peek() : null;
+ 
+-            while (this.canScheduleMoreTicks(maxAllowedTicks)) {
++            while (drained < maxRemainingForChunk && this.canScheduleMoreTicks(maxAllowedTicks)) {
+                 ScheduledTick<T> scheduledTick1 = levelChunkTicks.peek();
+                 if (scheduledTick1 == null
+                     || scheduledTick1.triggerTick() > gameTime
+@@ -166,8 +192,10 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+ 
+                 levelChunkTicks.poll();
+                 this.scheduleForThisTick(scheduledTick1);
++                drained++;
+             }
+         }
++        return drained;
+     }
+ 
+     private void scheduleForThisTick(ScheduledTick<T> tick) {
+@@ -193,6 +221,9 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+     private void cleanupAfterTick() {
+         //this.toRunThisTick.clear(); // Leaf - Avoid useless deque clear on LevelTicks#cleanupAfterTick - This method runs after toRunThisTick is polled so this is always empty
+         this.containersToTick.clear();
++        if (!this.drainedPerChunk.isEmpty()) {
++            this.drainedPerChunk.clear();
++        }
+         this.alreadyRunThisTick.clear();
+         this.toRunThisTickSet.clear();
+     }
