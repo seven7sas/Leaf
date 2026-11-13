@@ -6,6 +6,7 @@ public enum EnumConfigCategory {
     FIXES("fixes"),
     GAMEPLAY("gameplay-mechanisms"),
     NETWORK("network"),
+    ANTICHEAT("anticheat"),
     MISC("misc");
 
     private final String baseKeyName;

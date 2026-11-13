@@ -1,0 +1,1365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seven7sas <zazad2288@gmail.com>
+Date: Fri, 13 Nov 2026 06:09:07 +0300
+Subject: [PATCH] feat(anticheat): implement Underground Room Culling and
+ player chunk updates
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index 2fad390a0fdd146108586c45f81ff78b0f4e1263..6ea308a6d720c38deec770946af35506749dee1c 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -14,6 +14,7 @@ import ca.spottedleaf.moonrise.patches.chunk_system.level.chunk.ChunkSystemChunk
+ import ca.spottedleaf.moonrise.patches.chunk_system.level.chunk.ChunkSystemLevelChunk;
+ import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager;
+ import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler;
++import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder;
+ import ca.spottedleaf.moonrise.patches.chunk_system.ticket.ChunkSystemTicketType;
+ import ca.spottedleaf.moonrise.patches.chunk_system.util.ParallelSearchRadiusIteration;
+ import com.google.gson.JsonObject;
+@@ -314,7 +315,13 @@ public final class RegionizedPlayerChunkLoader {
+                 continue;
+             }
+             loader.update(); // can't invoke plugin logic
+-            loader.updateQueues(currTime);
++            loader.updateQueues(currTime, true);
++            for (int extra = 0; extra < 2; ++extra) {
++                if (loader.removed || loader.sentChunks.size() >= 49 || !loader.hasReadyFullChunkPending()) {
++                    break;
++                }
++                loader.updateQueues(currTime, false);
++            }
+             loader.advanceSpawnRamp(); // Leaf - Smooth chunk send ramp-up on spawn / teleport
+         }
+     }
+@@ -402,8 +409,60 @@ public final class RegionizedPlayerChunkLoader {
+         private static final int RAMP_DURATION_TICKS = 8;
+         private boolean rampingUp = false;
+         private int rampTickCount = 0;
++        private int tickHotGensRemaining = 0;
++        private int tickColdGensRemaining = Integer.MAX_VALUE;
++        private int tickRampedSendsRemaining = Integer.MAX_VALUE;
+         // Leaf end - Smooth chunk send ramp-up on spawn / teleport
+ 
++        private boolean isBoostUnderLoad() {
++            if (org.dreeam.leaf.async.chunk.AsyncChunkSend.isOverloaded()) {
++                return true;
++            }
++            final net.minecraft.server.MinecraftServer server = this.world.getServer();
++            if (server == null) {
++                return true;
++            }
++            if (this.sentChunks.size() < 49) {
++                // Ignore single-tick login event spikes during initial 7x7 chunk stream
++                return server.getAverageTickTimeNanos() > 45_000_000L;
++            }
++            final long budgetNanos = server.tickRateManager().nanosecondsPerTick();
++            final long loadThresholdNanos = (budgetNanos * 4L) / 5L;
++            if (server.lagging || server.getAverageTickTimeNanos() > loadThresholdNanos) {
++                return true;
++            }
++            final long loadThresholdMillis = Math.max(1L, loadThresholdNanos / 1_000_000L);
++            return net.minecraft.server.MinecraftServer.lastTickProperTime > loadThresholdMillis;
++        }
++
++        private boolean hasReadyFullChunkPending() {
++            if (!this.sendQueue.isEmpty()) {
++                return true;
++            }
++            if (!this.loadingQueue.isEmpty()) {
++                final long nextLoad = this.loadingQueue.firstLong();
++                if (((ChunkSystemLevel)this.world).moonrise$getAnyChunkIfLoaded(
++                    CoordinateUtils.getChunkX(nextLoad), CoordinateUtils.getChunkZ(nextLoad)) != null) {
++                    return true;
++                }
++            }
++            if (!this.generatingQueue.isEmpty()) {
++                final long nextGen = this.generatingQueue.firstLong();
++                if (((ChunkSystemLevel)this.world).moonrise$getFullChunkIfLoaded(
++                    CoordinateUtils.getChunkX(nextGen), CoordinateUtils.getChunkZ(nextGen)) != null) {
++                    return true;
++                }
++            }
++            if (!this.genQueue.isEmpty()) {
++                final long nextPromote = this.genQueue.firstLong();
++                final NewChunkHolder holder = ((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler().chunkHolderManager.getChunkHolder(nextPromote);
++                if (holder != null && holder.getCurrentGenStatus() == ChunkStatus.FULL) {
++                    return true;
++                }
++            }
++            return false;
++        }
++
+         public PlayerChunkLoaderData(final ServerLevel world, final ServerPlayer player) {
+             this.world = world;
+             this.player = player;
+@@ -711,6 +770,19 @@ public final class RegionizedPlayerChunkLoader {
+             if (this.removed) {
+                 throw new IllegalStateException("Ticking removed player chunk loader");
+             }
++            final boolean boostAllowed = !this.isBoostUnderLoad();
++            final boolean initial7x7Active = this.sentChunks.size() < 49;
++            final int hotLimit = boostAllowed ? (initial7x7Active ? 49 : 32) : 0;
++            if (allowInitialLoadBurst) {
++                this.tickHotGensRemaining = hotLimit;
++                this.tickColdGensRemaining = this.rampingUp ? (12 + this.rampTickCount * 6) : Integer.MAX_VALUE;
++                final int rampedTarget = Math.max(16 + this.rampTickCount * 12, initial7x7Active ? 49 : 0);
++                this.tickRampedSendsRemaining = this.rampingUp
++                    ? ((boostAllowed && this.asyncSender != null) ? rampedTarget : (9 + this.rampTickCount * 8))
++                    : Integer.MAX_VALUE;
++            }
++            final ChunkTaskScheduler taskScheduler = ((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler();
++            final ChunkHolderManager holderManager = taskScheduler.chunkHolderManager;
+             // update rate limits
+             final double loadRate = this.getMaxChunkLoadRate();
+             final double genRate = this.getMaxChunkGenRate();
+@@ -745,17 +817,34 @@ public final class RegionizedPlayerChunkLoader {
+             }
+ 
+             // try to push more chunk loads
+-            // Leaf start - Smooth chunk send ramp-up: cap per-tick load promotions during spawn/teleport
+-            final long rampLoadCap = this.rampingUp ? (16L + (long)this.rampTickCount * 12L) : MAX_RATE;
+-            final long maxLoads = Math.max(0L, Math.min(rampLoadCap, Math.min(MAX_RATE, Math.min(this.loadQueue.size(), this.getMaxChunkLoads()))));
+-            // Leaf end
+-            int maxLoadsThisTick = (int)this.chunkLoadTicketLimiter.takeAllocation(time, loadRate, maxLoads);
+-            if (allowInitialLoadBurst && ((this.rampingUp && this.rampTickCount == 0) || (!this.rampingUp && this.sentChunks.isEmpty()))) {
+-                maxLoadsThisTick = Math.max(maxLoadsThisTick, Math.min(25, this.loadQueue.size()));
++            // Leaf start - Smooth chunk send ramp-up: separate RAM-hot FULL chunks (+32) from cold disk chunks (12 + 6*tick)
++            final long rampLoadCap = this.rampingUp ? (12L + (long)this.rampTickCount * 6L) : MAX_RATE;
++            final long maxColdLoads = Math.max(0L, Math.min(rampLoadCap, Math.min(MAX_RATE, Math.min(this.loadQueue.size(), this.getMaxChunkLoads()))));
++            int coldLoadsRemaining = (int)this.chunkLoadTicketLimiter.takeAllocation(time, loadRate, maxColdLoads);
++            if (allowInitialLoadBurst && boostAllowed && ((this.rampingUp && this.rampTickCount == 0) || (!this.rampingUp && this.sentChunks.isEmpty()))) {
++                coldLoadsRemaining = Math.max(coldLoadsRemaining, (int)Math.min(9L, maxColdLoads));
+             }
+-            if (maxLoadsThisTick > 0) {
+-                final LongArrayList chunks = new LongArrayList(maxLoadsThisTick);
+-                for (int i = 0; i < maxLoadsThisTick; ++i) {
++            int hotLoadsRemaining = allowInitialLoadBurst ? hotLimit : 0;
++            // Leaf end
++            if ((coldLoadsRemaining > 0 || hotLoadsRemaining > 0) && !this.loadQueue.isEmpty()) {
++                final LongArrayList chunks = new LongArrayList(Math.min(this.loadQueue.size(), coldLoadsRemaining + hotLoadsRemaining));
++                while (!this.loadQueue.isEmpty()) {
++                    final long nextChunk = this.loadQueue.firstLong();
++                    final NewChunkHolder holder = holderManager.getChunkHolder(nextChunk);
++                    final boolean isHotFull = holder != null && holder.getCurrentGenStatus() == ChunkStatus.FULL;
++                    if (isHotFull) {
++                        if (hotLoadsRemaining > 0) {
++                            --hotLoadsRemaining;
++                        } else if (coldLoadsRemaining > 0) {
++                            --coldLoadsRemaining;
++                        } else {
++                            break;
++                        }
++                    } else if (coldLoadsRemaining > 0) {
++                        --coldLoadsRemaining;
++                    } else {
++                        break;
++                    }
+                     final long chunk = this.loadQueue.dequeueLong();
+                     final byte prev = this.chunkTicketStage.put(chunk, CHUNK_TICKET_STAGE_LOADING);
+                     if (prev != CHUNK_TICKET_STAGE_NONE) {
+@@ -770,29 +859,31 @@ public final class RegionizedPlayerChunkLoader {
+                     this.loadingQueue.enqueue(chunk);
+                 }
+ 
+-                // here we need to flush tickets, as scheduleChunkLoad requires tickets to be propagated with addTicket = false
+-                this.flushDelayedTicketOps();
+-                // we only need to call scheduleChunkLoad because the loaded ticket level is not enough to start the chunk
+-                // load - only generate ticket levels start anything, but they start generation...
+-                // propagate levels
+-                // Note: this CAN call plugin logic, so it is VITAL that our bookkeeping logic is completely done by the time this is invoked
+-                ((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler().chunkHolderManager.processTicketUpdates();
++                if (!chunks.isEmpty()) {
++                    // here we need to flush tickets, as scheduleChunkLoad requires tickets to be propagated with addTicket = false
++                    this.flushDelayedTicketOps();
++                    // we only need to call scheduleChunkLoad because the loaded ticket level is not enough to start the chunk
++                    // load - only generate ticket levels start anything, but they start generation...
++                    // propagate levels
++                    // Note: this CAN call plugin logic, so it is VITAL that our bookkeeping logic is completely done by the time this is invoked
++                    holderManager.processTicketUpdates();
+ 
+-                if (this.removed) {
+-                    // process ticket updates may invoke plugin logic, which may remove this player
+-                    return;
+-                }
+-
+-                for (int i = 0; i < maxLoadsThisTick; ++i) {
+-                    final long queuedLoadChunk = chunks.getLong(i);
+-                    final int queuedChunkX = CoordinateUtils.getChunkX(queuedLoadChunk);
+-                    final int queuedChunkZ = CoordinateUtils.getChunkZ(queuedLoadChunk);
+-                    ((ChunkSystemServerLevel)this.world).moonrise$getChunkTaskScheduler().scheduleChunkLoad(
+-                        queuedChunkX, queuedChunkZ, ChunkStatus.EMPTY, false, Priority.NORMAL, null
+-                    );
+                     if (this.removed) {
++                        // process ticket updates may invoke plugin logic, which may remove this player
+                         return;
+                     }
++
++                    for (int i = 0, len = chunks.size(); i < len; ++i) {
++                        final long queuedLoadChunk = chunks.getLong(i);
++                        final int queuedChunkX = CoordinateUtils.getChunkX(queuedLoadChunk);
++                        final int queuedChunkZ = CoordinateUtils.getChunkZ(queuedLoadChunk);
++                        taskScheduler.scheduleChunkLoad(
++                            queuedChunkX, queuedChunkZ, ChunkStatus.EMPTY, false, Priority.NORMAL, null
++                        );
++                        if (this.removed) {
++                            return;
++                        }
++                    }
+                 }
+             }
+ 
+@@ -830,15 +921,18 @@ public final class RegionizedPlayerChunkLoader {
+             // preview the allocations, as we may not actually utilise all of them
+             final long maxGensThisTick = this.chunkGenerateTicketLimiter.previewAllocation(time, genRate, maxGens);
+             long ratedGensThisTick = 0L;
+-            // Leaf start - Smooth chunk send ramp-up: cap per-tick pre-generated chunk promotions during spawn/teleport
+-            final int maxRampGenPromote = this.rampingUp ? (16 + this.rampTickCount * 8) : Integer.MAX_VALUE;
+-            int totalGensPromoted = 0;
+-            // Leaf end
++            // Leaf start - Smooth chunk send ramp-up: separate RAM-hot FULL chunks from cold ChunkFullTask promotions
+             while (!this.genQueue.isEmpty()) {
+-                if (totalGensPromoted >= maxRampGenPromote) { // Leaf - Smooth chunk send ramp-up
++                final long chunkKey = this.genQueue.firstLong();
++                final NewChunkHolder genHolder = holderManager.getChunkHolder(chunkKey);
++                final boolean isHotFull = genHolder != null && genHolder.getCurrentGenStatus() == ChunkStatus.FULL;
++                if (isHotFull) {
++                    if (this.tickHotGensRemaining <= 0 && this.tickColdGensRemaining <= 0) {
++                        break;
++                    }
++                } else if (this.tickColdGensRemaining <= 0) {
+                     break;
+                 }
+-                final long chunkKey = this.genQueue.firstLong();
+                 final int chunkX = CoordinateUtils.getChunkX(chunkKey);
+                 final int chunkZ = CoordinateUtils.getChunkZ(chunkKey);
+                 final ChunkAccess chunk = ((ChunkSystemLevel)this.world).moonrise$getAnyChunkIfLoaded(chunkX, chunkZ);
+@@ -850,7 +944,16 @@ public final class RegionizedPlayerChunkLoader {
+                     ++ratedGensThisTick;
+                 }
+ 
+-                totalGensPromoted++; // Leaf - Smooth chunk send ramp-up
++                if (isHotFull) {
++                    if (this.tickHotGensRemaining > 0) {
++                        --this.tickHotGensRemaining;
++                    } else {
++                        --this.tickColdGensRemaining;
++                    }
++                } else {
++                    --this.tickColdGensRemaining;
++                }
++                // Leaf end
+                 this.genQueue.dequeueLong();
+ 
+                 final byte prev = this.chunkTicketStage.put(chunkKey, CHUNK_TICKET_STAGE_GENERATING);
+@@ -907,20 +1010,25 @@ public final class RegionizedPlayerChunkLoader {
+             // try to pull sending chunks
+             final long maxSends = Math.max(0L, Math.min(MAX_RATE, Integer.MAX_VALUE)); // note: no logic to track concurrent sends
+             int maxSendsThisTick = Math.min((int)this.chunkSendLimiter.takeAllocation(time, sendRate, maxSends), this.sendQueue.size());
+-            // Leaf start - Smooth chunk send ramp-up: start with 9 priority chunks on spawn tick and expand smoothly
++            // Leaf start - Smooth chunk send ramp-up: async encode up to 16 + 12*tick chunks when not overloaded
+             if (this.rampingUp) {
+-                final int rampSendCap = 9 + this.rampTickCount * 8;
+-                if (maxSendsThisTick > rampSendCap) {
+-                    maxSendsThisTick = rampSendCap;
+-                }
+-                if (this.rampTickCount == 0) {
+-                    maxSendsThisTick = Math.max(maxSendsThisTick, Math.min(9, this.sendQueue.size()));
++                if (boostAllowed && this.asyncSender != null) {
++                    maxSendsThisTick = Math.min(this.tickRampedSendsRemaining, this.sendQueue.size());
++                } else {
++                    final int fallbackCap = Math.min(this.tickRampedSendsRemaining, 9 + this.rampTickCount * 8);
++                    if (maxSendsThisTick > fallbackCap) {
++                        maxSendsThisTick = fallbackCap;
++                    }
++                    if (this.sentChunks.size() < 9) {
++                        maxSendsThisTick = Math.max(maxSendsThisTick, Math.min(9 - this.sentChunks.size(), this.sendQueue.size()));
++                    }
+                 }
+             } else if (this.sentChunks.size() < 9) {
+                 maxSendsThisTick = Math.max(maxSendsThisTick, Math.min(9 - this.sentChunks.size(), this.sendQueue.size()));
+             }
+             // Leaf end
+             // we do not return sends that we took from the allocation back because we want to limit the max send rate, not target it
++            int sentThisPass = 0;
+             for (int i = 0; i < maxSendsThisTick; ++i) {
+                 final long pendingSend = this.sendQueue.firstLong();
+                 final int pendingSendX = CoordinateUtils.getChunkX(pendingSend);
+@@ -936,6 +1044,9 @@ public final class RegionizedPlayerChunkLoader {
+                     chunk.postProcessGeneration(this.world);
+                     // check if there was any recursive action
+                     if (this.removed || this.sendQueue.isEmpty() || this.sendQueue.firstLong() != pendingSend) {
++                        if (this.rampingUp && this.tickRampedSendsRemaining != Integer.MAX_VALUE) {
++                            this.tickRampedSendsRemaining = Math.max(0, this.tickRampedSendsRemaining - sentThisPass);
++                        }
+                         return;
+                     } // else: good to dequeue and send, fall through
+                 }
+@@ -946,14 +1057,17 @@ public final class RegionizedPlayerChunkLoader {
+                     if (this.sentChunks.size() < 9 && Math.max(Math.abs(pendingSendX - this.lastChunkX), Math.abs(pendingSendZ - this.lastChunkZ)) <= 1) {
+                         this.sendQueue.dequeueLong();
+                         this.sendChunk(pendingSendX, pendingSendZ);
++                        sentThisPass++;
+                     } else if (this.leaf$sendChunk(pendingSendX, pendingSendZ)) {
+                         this.sendQueue.dequeueLong();
++                        sentThisPass++;
+                     } else {
+                         break;
+                     }
+                 } else {
+                     this.sendQueue.dequeueLong();
+                     this.sendChunk(pendingSendX, pendingSendZ);
++                    sentThisPass++;
+                 }
+                 // Leaf end - async chunk sender
+ 
+@@ -962,6 +1076,9 @@ public final class RegionizedPlayerChunkLoader {
+                     return;
+                 }
+             }
++            if (this.rampingUp && this.tickRampedSendsRemaining != Integer.MAX_VALUE) {
++                this.tickRampedSendsRemaining = Math.max(0, this.tickRampedSendsRemaining - sentThisPass);
++            }
+             // Leaf start - async chunk sender
+             if (this.asyncSender != null) {
+                 net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket packet;
+@@ -1026,16 +1143,6 @@ public final class RegionizedPlayerChunkLoader {
+ 
+             // now we can update
+             this.update();
+-            if (!this.removed) {
+-                final long queueTime = System.nanoTime();
+-                this.updateQueues(queueTime, true);
+-                if (!this.removed && this.sentChunks.size() < 9 && (!this.loadingQueue.isEmpty() || !this.genQueue.isEmpty() || !this.generatingQueue.isEmpty())) {
+-                    this.updateQueues(queueTime, false);
+-                    if (!this.removed && this.sentChunks.size() < 9 && (!this.generatingQueue.isEmpty() || !this.sendQueue.isEmpty())) {
+-                        this.updateQueues(queueTime, false);
+-                    }
+-                }
+-            }
+         }
+ 
+         private boolean isLoadedChunkGeneratable(final int chunkX, final int chunkZ) {
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index 980064656dfd5a95e8e962f65253f3e73f858925..17564e2b0ba83976e3da099fed8d8df49f87b096 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -287,7 +287,7 @@ public final class ChunkHolderManager {
+ 
+         long start = System.nanoTime();
+         long lastLog = start;
+-        final int flushInterval = 200;
++        final int flushThreshold = shutdown && !emergency ? 512 : 100;
+         int lastFlush = 0;
+ 
+         int savedChunk = 0;
+@@ -325,9 +325,9 @@ public final class ChunkHolderManager {
+             } catch (final Throwable thr) {
+                 LOGGER.error("Failed to save chunk (" + holder.chunkX + "," + holder.chunkZ + ") in world '" + WorldUtil.getWorldName(this.world) + "'", thr);
+             }
+-            if (flush && (saved - lastFlush) > (flushInterval / 2)) {
++            if (flush && (saved - lastFlush) > flushThreshold) {
+                 lastFlush = saved;
+-                MoonriseRegionFileIO.partialFlush(this.world, flushInterval / 2);
++                MoonriseRegionFileIO.partialFlush(this.world, flushThreshold);
+             }
+             if (logProgress) {
+                 final long currTime = System.nanoTime();
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+index 0ca348d43143d11ba6dd0e6df33b5ee90ad8c381..3cbc7220686813b1fe2989233c8b5f657b8b36b0 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+@@ -1684,7 +1684,7 @@ public final class NewChunkHolder {
+         boolean canSaveEntities = entities != null;
+ 
+         if (canSaveChunk) {
+-            canSaveChunk = this.saveChunk(chunk, false, null);
++            canSaveChunk = this.saveChunk(chunk, false, null, shutdown ? Priority.HIGH : Priority.NORMAL);
+         }
+         if (canSavePOI) {
+             canSavePOI = this.savePOI(poi, false, null);
+@@ -1704,6 +1704,10 @@ public final class NewChunkHolder {
+     }
+ 
+     private boolean saveChunk(final ChunkAccess chunk, final boolean unloading, final Completable<CompoundTag>[] chunkSave) {
++        return this.saveChunk(chunk, unloading, chunkSave, Priority.NORMAL);
++    }
++
++    private boolean saveChunk(final ChunkAccess chunk, final boolean unloading, final Completable<CompoundTag>[] chunkSave, final Priority priority) {
+         // Leaf start - disable world data saving
+         if (org.dreeam.leaf.config.modules.misc.DisableWorldDataSaving.shouldSkipSave(this.world) || org.dreeam.leaf.config.modules.misc.RegionFormatConfig.isReadOnlyMode()) { // Leaf - Add read-only mode for Linear v2
+             if (chunk.isUnsaved()) {
+@@ -1742,13 +1746,13 @@ public final class NewChunkHolder {
+                 this.chunkDataUnload.toRun().setRunnable(run);
+                 task = this.chunkDataUnload.task();
+             } else {
+-                task = this.scheduler.saveExecutor.createTask(run);
++                task = this.scheduler.saveExecutor.createTask(run, priority);
+             }
+ 
+             task.queue();
+ 
+             MoonriseRegionFileIO.scheduleSave(
+-                this.world, this.chunkX, this.chunkZ, completable, task, MoonriseRegionFileIO.RegionFileType.CHUNK_DATA, Priority.NORMAL
++                this.world, this.chunkX, this.chunkZ, completable, task, MoonriseRegionFileIO.RegionFileType.CHUNK_DATA, priority
+             );
+             if (chunkSave != null) {
+                 chunkSave[0] = completable;
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java
+index 7463cf5bf871033a0e5f6d54dd0d427c474d7cd4..2e626846ff9f490555f662be9fafe45351e001ad 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java
+@@ -340,6 +340,7 @@ public final class ChunkLoadTask extends ChunkProgressionTask {
+ 
+             try {
+                 // run converters
++                final int rawDataVersion = net.minecraft.nbt.NbtUtils.getDataVersion(data, -1); // Leaf - Track version upgrades
+                 final CompoundTag converted = this.world.getChunkSource().chunkMap.upgradeChunkTag(data);
+ 
+                 // unpack the data
+@@ -356,6 +357,9 @@ public final class ChunkLoadTask extends ChunkProgressionTask {
+                     this.world, this.world.getPoiManager(), this.world.getChunkSource().chunkMap.storageInfo(),
+                     new ChunkPos(this.chunkX, this.chunkZ)
+                 );
++                if (chunk != null && rawDataVersion != net.minecraft.SharedConstants.getCurrentVersion().dataVersion().version()) { // Leaf - Persist DataFixer upgrades
++                    chunk.markUnsaved();
++                }
+ 
+                 return new TaskResult<>(new ReadChunk(chunk, chunkData), null);
+             } catch (final Throwable thr2) {
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+index 057c8f3ec1ff993f650dbdee392c4aefde991185..e1137e3af3f54aedc164243c69941e5a45f640ad 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+@@ -413,6 +413,31 @@ public final class SWMRNibbleArray {
+         }
+     }
+ 
++    // Leaf start - Underground Room Culling: zero allocation skylight check
++    public boolean isZeroLight() {
++        switch (this.stateVisible) {
++            case INIT_STATE_NULL:
++                return false; // Null state in StarLight = open sky (light level 15)
++            case INIT_STATE_UNINIT:
++            case INIT_STATE_HIDDEN:
++                return true; // Zero light
++            case INIT_STATE_INIT:
++                final byte[] storage = this.storageVisible;
++                if (storage == null) {
++                    return false;
++                }
++                for (int i = 0; i < storage.length; i++) {
++                    if (storage[i] != 0) {
++                        return false;
++                    }
++                }
++                return true;
++            default:
++                return false;
++        }
++    }
++    // Leaf end - Underground Room Culling
++
+     /* x | (z << 4) | (y << 8) */
+ 
+     // operation type: updating
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java
+index a2fb9f49584467913a064ca0104101f45ff589e2..2fdb47c44be972ed9f5f1c05a62a72556b36a849 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java
+@@ -220,6 +220,34 @@ public final class StarLightInterface {
+         return this.hasBlockLight;
+     }
+ 
++    // Leaf start - Underground Room Culling: zero allocation skylight check
++    public boolean isSkyLightZero(int chunkX, int sectionY, int chunkZ) {
++        if (!this.hasSkyLight) {
++            return true;
++        }
++        if (sectionY > this.maxLightSection || sectionY < this.minLightSection) {
++            return false;
++        }
++        final ChunkAccess chunk = this.getAnyChunkNow(chunkX, chunkZ);
++        if (chunk == null || (!this.isClientSide && !chunk.isLightCorrect()) || !chunk.getPersistedStatus().isOrAfter(ChunkStatus.LIGHT)) {
++            return false;
++        }
++        if (((StarlightChunk)chunk).starlight$getSkyEmptinessMap() == null) {
++            return false;
++        }
++        SWMRNibbleArray[] skyNibbles = ((StarlightChunk)chunk).starlight$getSkyNibbles();
++        if (skyNibbles == null) {
++            return false;
++        }
++        int sectionIndex = sectionY - this.minLightSection;
++        if (sectionIndex < 0 || sectionIndex >= skyNibbles.length) {
++            return false;
++        }
++        SWMRNibbleArray nibble = skyNibbles[sectionIndex];
++        return nibble != null && nibble.isZeroLight();
++    }
++    // Leaf end - Underground Room Culling
++
+     public int getSkyLightValue(final BlockPos blockPos, final ChunkAccess chunk) {
+         if (!this.hasSkyLight) {
+             return 0;
+diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
+index 4a0d5b4f1ce98b334e7812d3bbe12db2f7f6c958..ff971390a57cc8b8db975437e3eb7f798af61400 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
++++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
+@@ -3,6 +3,7 @@ package net.minecraft.network.protocol.game;
+ import com.google.common.collect.Lists;
+ import io.netty.buffer.ByteBuf;
+ import io.netty.buffer.Unpooled;
++import io.papermc.paper.antixray.ChunkPacketInfo;
+ import java.util.EnumMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -15,10 +16,13 @@ import net.minecraft.core.registries.Registries;
+ import net.minecraft.nbt.CompoundTag;
+ import net.minecraft.network.FriendlyByteBuf;
+ import net.minecraft.network.RegistryFriendlyByteBuf;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.network.codec.ByteBufCodecs;
+ import net.minecraft.network.codec.StreamCodec;
+ import net.minecraft.world.level.block.entity.BlockEntity;
+ import net.minecraft.world.level.block.entity.BlockEntityType;
++import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.chunk.LevelChunk;
+ import net.minecraft.world.level.chunk.LevelChunkSection;
+ import net.minecraft.world.level.levelgen.Heightmap;
+@@ -32,6 +36,9 @@ public class ClientboundLevelChunkPacketData {
+     private final Map<Heightmap.Types, long[]> heightmaps;
+     private final byte[] buffer;
+     private final List<ClientboundLevelChunkPacketData.BlockEntityInfo> blockEntitiesData;
++    public static final int STONE_ID = net.minecraft.world.level.block.Block.getId(net.minecraft.world.level.block.Blocks.STONE.defaultBlockState());
++    public static final int DEEPSLATE_ID = net.minecraft.world.level.block.Block.getId(net.minecraft.world.level.block.Blocks.DEEPSLATE.defaultBlockState());
++
+     // Paper start - Handle oversized block entities in chunks
+     private final java.util.List<net.minecraft.network.protocol.Packet<?>> extraPackets = new java.util.ArrayList<>();
+     private static final int BLOCK_ENTITY_LIMIT = Integer.getInteger("Paper.excessiveTELimit", 750);
+@@ -47,21 +54,30 @@ public class ClientboundLevelChunkPacketData {
+         this(levelChunk, null);
+     }
+     public ClientboundLevelChunkPacketData(LevelChunk levelChunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
++        this(levelChunk, chunkPacketInfo, (ServerPlayer) null);
++    }
++    public ClientboundLevelChunkPacketData(LevelChunk levelChunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, @Nullable ServerPlayer player) {
+         // Paper end - Anti-Xray - Add chunk packet info
+         this.heightmaps = levelChunk.getHeightmaps()
+             .stream()
+             .filter(entry1 -> entry1.getKey().sendToClient())
+             .collect(Collectors.toMap(Entry::getKey, entry1 -> (long[])entry1.getValue().getRawData().clone()));
+-        this.buffer = new byte[calculateChunkSize(levelChunk)];
++        long culledSectionsMask = computeCulledSectionsMask(levelChunk, player);
++        this.buffer = new byte[calculateChunkSize(levelChunk, culledSectionsMask)];
+         // Paper start - Anti-Xray - Add chunk packet info
+         if (chunkPacketInfo != null) {
+             chunkPacketInfo.setBuffer(this.buffer);
+         }
+-        extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo);
++        extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo, culledSectionsMask, player);
+         this.blockEntitiesData = Lists.newArrayList();
+         int totalTileEntities = 0; // Paper - Handle oversized block entities in chunks
+ 
+         for (Entry<BlockPos, BlockEntity> entry : levelChunk.getBlockEntities().entrySet()) {
++            BlockEntity blockEntity = entry.getValue();
++            int beSectionIdx = levelChunk.getSectionIndex(blockEntity.getBlockPos().getY());
++            if (beSectionIdx >= 0 && beSectionIdx < 64 && (culledSectionsMask & (1L << beSectionIdx)) != 0L) {
++                continue;
++            }
+             // Paper start - Handle oversized block entities in chunks
+             if (++totalTileEntities > BLOCK_ENTITY_LIMIT) {
+                 net.minecraft.network.protocol.Packet<ClientGamePacketListener> packet = entry.getValue().getUpdatePacket();
+@@ -77,17 +93,25 @@ public class ClientboundLevelChunkPacketData {
+ 
+     // Leaf start - async chunk sender
+     public ClientboundLevelChunkPacketData(LevelChunk levelChunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, BlockEntity[] blockEntities, Map<Heightmap.Types, long[]> heightmaps) {
++        this(levelChunk, chunkPacketInfo, blockEntities, heightmaps, null);
++    }
++    public ClientboundLevelChunkPacketData(LevelChunk levelChunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, BlockEntity[] blockEntities, Map<Heightmap.Types, long[]> heightmaps, @Nullable ServerPlayer player) {
+         this.heightmaps = heightmaps;
++        long culledSectionsMask = computeCulledSectionsMask(levelChunk, player);
+         int size;
+         ByteBuf buffer;
+         do {
+-            buffer = Unpooled.buffer(size = calculateChunkSize(levelChunk));
+-        } while (!extractChunkData(new FriendlyByteBuf(buffer), levelChunk, chunkPacketInfo, size));
++            buffer = Unpooled.buffer(size = calculateChunkSize(levelChunk, culledSectionsMask));
++        } while (!extractChunkData(new FriendlyByteBuf(buffer), levelChunk, chunkPacketInfo, size, culledSectionsMask, player));
+         this.buffer = it.unimi.dsi.fastutil.bytes.ByteArrays.setLength(buffer.array(), buffer.writerIndex());
+         this.blockEntitiesData = Lists.newArrayList();
+         int totalTileEntities = 0; // Paper - Handle oversized block entities in chunks
+ 
+         for (BlockEntity blockEntity : blockEntities) {
++            int beSectionIdx = levelChunk.getSectionIndex(blockEntity.getBlockPos().getY());
++            if (beSectionIdx >= 0 && beSectionIdx < 64 && (culledSectionsMask & (1L << beSectionIdx)) != 0L) {
++                continue;
++            }
+             // Paper start - Handle oversized block entities in chunks
+             if (++totalTileEntities > BLOCK_ENTITY_LIMIT) {
+                 net.minecraft.network.protocol.Packet<ClientGamePacketListener> packet = blockEntity.getUpdatePacket();
+@@ -125,13 +149,50 @@ public class ClientboundLevelChunkPacketData {
+         ClientboundLevelChunkPacketData.BlockEntityInfo.LIST_STREAM_CODEC.encode(buffer, this.blockEntitiesData);
+     }
+ 
++    public static long computeCulledSectionsMask(LevelChunk chunk, @Nullable ServerPlayer player) {
++        ServerLevel serverLevel = (chunk.getLevel() instanceof ServerLevel sl) ? sl : null;
++        if (player == null || serverLevel == null
++            || !org.dreeam.leaf.config.modules.anticheat.UndergroundRoomCullingConfig.isWorldEnabled(serverLevel.getWorld().getName())
++            || player.leaf$roomVisibility.canBypass(player)) {
++            return 0L;
++        }
++        long mask = 0L;
++        ChunkPos chunkPos = chunk.getPos();
++        LevelChunkSection[] sections = chunk.getSections();
++        for (int i = 0; i < sections.length; i++) {
++            LevelChunkSection levelChunkSection = sections[i];
++            int sectionY = chunk.getSectionYFromSectionIndex(i);
++            if (org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isSectionCulledFast(
++                player.leaf$roomVisibility, serverLevel, chunk, chunkPos.x, sectionY, chunkPos.z, levelChunkSection)) {
++                if (i < 64) {
++                    mask |= (1L << i);
++                }
++            }
++        }
++        return mask;
++    }
++
+     private static int calculateChunkSize(LevelChunk chunk) {
+-        int i = 0;
++        return calculateChunkSize(chunk, 0L);
++    }
+ 
++    private static int calculateChunkSize(LevelChunk chunk, @Nullable ServerPlayer player) {
++        return calculateChunkSize(chunk, computeCulledSectionsMask(chunk, player));
++    }
++
++    private static int calculateChunkSize(LevelChunk chunk, long culledSectionsMask) {
++        int i = 0;
++        int chunkSectionIndex = 0;
+         for (LevelChunkSection levelChunkSection : chunk.getSections()) {
+-            i += levelChunkSection.getSerializedSize();
++            if (chunkSectionIndex < 64 && (culledSectionsMask & (1L << chunkSectionIndex)) != 0L) {
++                int sectionY = chunk.getSectionYFromSectionIndex(chunkSectionIndex);
++                int replacementId = sectionY >= 0 ? STONE_ID : DEEPSLATE_ID;
++                i += 3 + net.minecraft.network.VarInt.getByteSize(replacementId) + levelChunkSection.getBiomes().getSerializedSize();
++            } else {
++                i += levelChunkSection.getSerializedSize();
++            }
++            chunkSectionIndex++;
+         }
+-
+         return i;
+     }
+ 
+@@ -147,29 +208,75 @@ public class ClientboundLevelChunkPacketData {
+         ClientboundLevelChunkPacketData.extractChunkData(buffer, chunk, null);
+     }
+     public static void extractChunkData(FriendlyByteBuf buffer, LevelChunk chunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
++        extractChunkData(buffer, chunk, chunkPacketInfo, (ServerPlayer) null);
++    }
++    public static void extractChunkData(FriendlyByteBuf buffer, LevelChunk chunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, @Nullable ServerPlayer player) {
++        extractChunkData(buffer, chunk, chunkPacketInfo, computeCulledSectionsMask(chunk, player), player);
++    }
++    public static void extractChunkData(FriendlyByteBuf buffer, LevelChunk chunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, long culledSectionsMask, @Nullable ServerPlayer player) {
+         int chunkSectionIndex = 0;
++        ChunkPos chunkPos = chunk.getPos();
++        boolean anySectionCulled = (culledSectionsMask != 0L);
++
+         for (LevelChunkSection levelChunkSection : chunk.getSections()) {
+-            levelChunkSection.write(buffer, chunkPacketInfo, chunkSectionIndex);
++            if (chunkSectionIndex < 64 && (culledSectionsMask & (1L << chunkSectionIndex)) != 0L) {
++                int sectionY = chunk.getSectionYFromSectionIndex(chunkSectionIndex);
++                writeCulledSection(buffer, levelChunkSection, sectionY, chunkSectionIndex, chunkPacketInfo);
++            } else {
++                levelChunkSection.write(buffer, chunkPacketInfo, chunkSectionIndex);
++            }
+             chunkSectionIndex++;
+             // Paper end  - Anti-Xray - Add chunk packet info
+         }
+ 
++        if (player != null) {
++            player.leaf$roomVisibility.setChunkCulledMask(chunkPos.toLong(), culledSectionsMask);
++        }
++
+         if (buffer.writerIndex() != buffer.capacity()) {
+             throw new IllegalStateException("Didn't fill chunk buffer: expected " + buffer.capacity() + " bytes, got " + buffer.writerIndex());
+         }
+     }
+     // Leaf start - async chunk sender
+     public static boolean extractChunkData(FriendlyByteBuf buffer, LevelChunk chunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, int expected) {
++        return extractChunkData(buffer, chunk, chunkPacketInfo, expected, computeCulledSectionsMask(chunk, null), null);
++    }
++    public static boolean extractChunkData(FriendlyByteBuf buffer, LevelChunk chunk, io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, int expected, long culledSectionsMask, @Nullable ServerPlayer player) {
+         int chunkSectionIndex = 0;
++        ChunkPos chunkPos = chunk.getPos();
++        boolean anySectionCulled = (culledSectionsMask != 0L);
++
+         for (LevelChunkSection levelChunkSection : chunk.getSections()) {
+-            levelChunkSection.write(buffer, chunkPacketInfo, chunkSectionIndex);
++            if (chunkSectionIndex < 64 && (culledSectionsMask & (1L << chunkSectionIndex)) != 0L) {
++                int sectionY = chunk.getSectionYFromSectionIndex(chunkSectionIndex);
++                writeCulledSection(buffer, levelChunkSection, sectionY, chunkSectionIndex, chunkPacketInfo);
++            } else {
++                levelChunkSection.write(buffer, chunkPacketInfo, chunkSectionIndex);
++            }
+             chunkSectionIndex++;
+             // Paper end  - Anti-Xray - Add chunk packet info
+         }
++        if (player != null) {
++            player.leaf$roomVisibility.setChunkCulledMask(chunkPos.toLong(), culledSectionsMask);
++        }
+         return buffer.writerIndex() == expected;
+     }
+     // Leaf end - async chunk sender
+ 
++    public static void writeCulledSection(FriendlyByteBuf buffer, LevelChunkSection section, int sectionY, int chunkSectionIndex) {
++        writeCulledSection(buffer, section, sectionY, chunkSectionIndex, null);
++    }
++
++    public static void writeCulledSection(FriendlyByteBuf buffer, LevelChunkSection section, int sectionY, int chunkSectionIndex, @Nullable ChunkPacketInfo<?> chunkPacketInfo) {
++        if (chunkPacketInfo != null) {
++            chunkPacketInfo.setBits(chunkSectionIndex, 0);
++        }
++        buffer.writeShort(4096);
++        buffer.writeByte(0);
++        buffer.writeVarInt(sectionY >= 0 ? STONE_ID : DEEPSLATE_ID);
++        section.getBiomes().write(buffer, null, chunkSectionIndex);
++    }
++
+     public Consumer<ClientboundLevelChunkPacketData.BlockEntityTagOutput> getBlockEntitiesTagsConsumer(int chunkX, int chunkZ) {
+         return blockEntityTagOutput -> this.getBlockEntitiesTags(blockEntityTagOutput, chunkX, chunkZ);
+     }
+diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+index 03470810c8dafc87c787fbd2aff2e1d301b0862e..1594894c9987a81cd8b3342c543722440259369e 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+@@ -5,6 +5,7 @@ import net.minecraft.network.RegistryFriendlyByteBuf;
+ import net.minecraft.network.codec.StreamCodec;
+ import net.minecraft.network.protocol.Packet;
+ import net.minecraft.network.protocol.PacketType;
++import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.chunk.LevelChunk;
+ import net.minecraft.world.level.lighting.LevelLightEngine;
+@@ -35,22 +36,28 @@ public class ClientboundLevelChunkWithLightPacket implements Packet<ClientGamePa
+         this(chunk, lightEngine, skyLight, blockLight, true);
+     }
+     public ClientboundLevelChunkWithLightPacket(LevelChunk chunk, LevelLightEngine lightEngine, @Nullable BitSet skyLight, @Nullable BitSet blockLight, boolean modifyBlocks) {
++        this(chunk, lightEngine, skyLight, blockLight, modifyBlocks, (ServerPlayer) null);
++    }
++    public ClientboundLevelChunkWithLightPacket(LevelChunk chunk, LevelLightEngine lightEngine, @Nullable BitSet skyLight, @Nullable BitSet blockLight, boolean modifyBlocks, @Nullable ServerPlayer player) {
+         // Paper end - Anti-Xray
+         ChunkPos pos = chunk.getPos();
+         this.x = pos.x;
+         this.z = pos.z;
+         io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo = modifyBlocks ? chunk.getLevel().chunkPacketBlockController.getChunkPacketInfo(this, chunk) : null; // Paper - Ant-Xray
+-        this.chunkData = new ClientboundLevelChunkPacketData(chunk, chunkPacketInfo); // Paper - Anti-Xray
++        this.chunkData = new ClientboundLevelChunkPacketData(chunk, chunkPacketInfo, player); // Paper - Anti-Xray // Leaf - Underground Room Culling
+         this.lightData = new ClientboundLightUpdatePacketData(pos, lightEngine, skyLight, blockLight);
+         chunk.getLevel().chunkPacketBlockController.modifyBlocks(this, chunkPacketInfo); // Paper - Anti-Xray - Modify blocks
+     }
+     // Leaf start - async chunk sender
+     public ClientboundLevelChunkWithLightPacket(LevelChunk chunk, LevelLightEngine lightEngine, @Nullable BitSet skyLight, @Nullable BitSet blockLight, boolean modifyBlocks, net.minecraft.world.level.block.entity.BlockEntity[] blockEntities, java.util.Map<net.minecraft.world.level.levelgen.Heightmap.Types, long[]> heightmaps) {
++        this(chunk, lightEngine, skyLight, blockLight, modifyBlocks, blockEntities, heightmaps, (ServerPlayer) null);
++    }
++    public ClientboundLevelChunkWithLightPacket(LevelChunk chunk, LevelLightEngine lightEngine, @Nullable BitSet skyLight, @Nullable BitSet blockLight, boolean modifyBlocks, net.minecraft.world.level.block.entity.BlockEntity[] blockEntities, java.util.Map<net.minecraft.world.level.levelgen.Heightmap.Types, long[]> heightmaps, @Nullable ServerPlayer player) {
+         ChunkPos pos = chunk.getPos();
+         this.x = pos.x;
+         this.z = pos.z;
+         io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo = modifyBlocks ? chunk.getLevel().chunkPacketBlockController.getChunkPacketInfo(this, chunk) : null; // Paper - Ant-Xray
+-        this.chunkData = new ClientboundLevelChunkPacketData(chunk, chunkPacketInfo, blockEntities, heightmaps); // Paper - Anti-Xray
++        this.chunkData = new ClientboundLevelChunkPacketData(chunk, chunkPacketInfo, blockEntities, heightmaps, player); // Paper - Anti-Xray // Leaf - Underground Room Culling
+         this.lightData = new ClientboundLightUpdatePacketData(pos, lightEngine, skyLight, blockLight);
+         chunk.getLevel().chunkPacketBlockController.leaf$modifyBlocks(this, chunkPacketInfo); // Paper - Anti-Xray - Modify blocks
+     }
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index 0e77c717d3481aae5d591a08eed1eb5f1439cdbf..5d53366b689951e60a05e521f1990d000d52ccc0 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -455,6 +455,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             if (org.purpurmc.purpur.PurpurConfig.beeCountPayload) org.purpurmc.purpur.task.BeehiveTask.instance().register(); // Purpur - Give bee counts in beehives to Purpur clients
+             if (org.dreeam.leaf.config.modules.async.AsyncMobSpawning.enabled) mobSpawnExecutor.start(); // Pufferfish
+ 
++            net.minecraft.world.level.storage.PlayerDataStorage.warmupSpawnAndRecentPlayers(this); // Leaf - Pre-warm spawn and recent player chunks
+             this.notificationManager().serverStarted();
+             return true;
+         }
+diff --git a/net/minecraft/server/level/ChunkHolder.java b/net/minecraft/server/level/ChunkHolder.java
+index 22123d8b0fd8741c6df4efaec56f3c694e0529a3..c8c7606d9c73dff922ac64bd707cb6697f65fa84 100644
+--- a/net/minecraft/server/level/ChunkHolder.java
++++ b/net/minecraft/server/level/ChunkHolder.java
+@@ -298,19 +298,50 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+                         if (!players.isEmpty()) {
+                             int sectionYFromSectionIndex = this.levelHeightAccessor.getSectionYFromSectionIndex(i);
+                             SectionPos sectionPos = SectionPos.of(chunk.getPos(), sectionYFromSectionIndex);
++                            int chunkX = chunk.getPos().x;
++                            int chunkZ = chunk.getPos().z;
+                             if (set.size() == 1) {
+                                 BlockPos blockPos = sectionPos.relativeToBlockPos(set.iterator().nextShort());
+                                 BlockState blockState = level.getBlockState(blockPos);
+-                                this.broadcast(players, new ClientboundBlockUpdatePacket(blockPos, blockState));
+-                                this.broadcastBlockEntityIfNeeded(players, level, blockPos, blockState);
++                                ClientboundBlockUpdatePacket blockUpdatePacket = new ClientboundBlockUpdatePacket(blockPos, blockState);
++                                Packet<?> tePacket = blockState.hasBlockEntity() ? getBlockEntityPacket(level, blockPos) : null;
++                                for (int pIdx = 0, pLen = players.size(); pIdx < pLen; pIdx++) {
++                                    ServerPlayer player = players.get(pIdx);
++                                    if (org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isSectionCulled(player, (ServerLevel) level, chunkX, sectionYFromSectionIndex, chunkZ)) {
++                                        continue;
++                                    }
++                                    player.connection.send(blockUpdatePacket);
++                                    if (tePacket != null) {
++                                        player.connection.send(tePacket);
++                                    }
++                                }
+                             } else {
+                                 LevelChunkSection section = chunk.getSection(i);
+                                 ClientboundSectionBlocksUpdatePacket clientboundSectionBlocksUpdatePacket = new ClientboundSectionBlocksUpdatePacket(
+                                     sectionPos, set, section
+                                 );
+-                                this.broadcast(players, clientboundSectionBlocksUpdatePacket);
++                                for (int pIdx = 0, pLen = players.size(); pIdx < pLen; pIdx++) {
++                                    ServerPlayer player = players.get(pIdx);
++                                    if (org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isSectionCulled(player, (ServerLevel) level, chunkX, sectionYFromSectionIndex, chunkZ)) {
++                                        continue;
++                                    }
++                                    player.connection.send(clientboundSectionBlocksUpdatePacket);
++                                }
+                                 clientboundSectionBlocksUpdatePacket.runUpdates(
+-                                    (blockPos1, blockState1) -> this.broadcastBlockEntityIfNeeded(players, level, blockPos1, blockState1)
++                                    (blockPos1, blockState1) -> {
++                                        if (blockState1.hasBlockEntity()) {
++                                            Packet<?> tePacket = getBlockEntityPacket(level, blockPos1);
++                                            if (tePacket != null) {
++                                                for (int pIdx = 0, pLen = players.size(); pIdx < pLen; pIdx++) {
++                                                    ServerPlayer player = players.get(pIdx);
++                                                    if (org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isSectionCulled(player, (ServerLevel) level, chunkX, sectionYFromSectionIndex, chunkZ)) {
++                                                        continue;
++                                                    }
++                                                    player.connection.send(tePacket);
++                                                }
++                                            }
++                                        }
++                                    }
+                                 );
+                             }
+                         }
+@@ -322,6 +353,11 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+         }
+     }
+ 
++    private static @Nullable Packet<?> getBlockEntityPacket(Level level, BlockPos pos) {
++        BlockEntity blockEntity = level.getBlockEntity(pos);
++        return blockEntity != null ? blockEntity.getUpdatePacket() : null;
++    }
++
+     private void broadcastBlockEntityIfNeeded(List<ServerPlayer> players, Level level, BlockPos pos, BlockState state) {
+         if (state.hasBlockEntity()) {
+             this.broadcastBlockEntity(players, level, pos);
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index b68920ca1996f5d6b616a8fcd4e77d061a302f39..cd5a4e37f670a5374269067d21cc86046ea1bf2b 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -252,6 +252,9 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+     private @Nullable Vec3 levitationStartPos;
+     private int levitationStartTime;
+     private boolean disconnected;
++    // Leaf start - Underground Room Culling
++    public final org.dreeam.leaf.anticheat.roomculling.PlayerRoomVisibilityTracker leaf$roomVisibility = new org.dreeam.leaf.anticheat.roomculling.PlayerRoomVisibilityTracker();
++    // Leaf end - Underground Room Culling
+     private int requestedViewDistance = 2;
+     public String language = null; // Paper - default to null
+     public java.util.Locale adventure$locale = java.util.Locale.US; // Paper
+@@ -936,6 +939,9 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+                 ((org.bukkit.craftbukkit.CraftWorldBorder) this.getBukkitEntity().getWorldBorder()).getHandle().tick();
+             }
+             // CraftBukkit end
++            // Leaf start - Underground Room Culling
++            this.leaf$roomVisibility.tick(this);
++            // Leaf end - Underground Room Culling
+         } catch (Throwable var4) {
+             CrashReport crashReport = CrashReport.forThrowable(var4, "Ticking player");
+             CrashReportCategory crashReportCategory = crashReport.addCategory("Player being ticked");
+@@ -2198,6 +2204,9 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+ 
+     public void disconnect() {
+         this.disconnected = true;
++        // Leaf start - Underground Room Culling
++        this.leaf$roomVisibility.reset();
++        // Leaf end - Underground Room Culling
+         this.ejectPassengers();
+ 
+         // Paper start - Workaround vehicle not tracking the passenger disconnection dismount
+@@ -2298,6 +2307,10 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+         // this.recipeBook.copyOverData(that.recipeBook); // CraftBukkit
+         this.seenCredits = that.seenCredits;
+         this.enteredNetherPosition = that.enteredNetherPosition;
++        // Leaf start - Underground Room Culling
++        this.leaf$roomVisibility.reset();
++        that.leaf$roomVisibility.reset();
++        // Leaf end - Underground Room Culling
+         this.chunkTrackingView = that.chunkTrackingView;
+         this.requestedDebugSubscriptions = that.requestedDebugSubscriptions;
+         this.setShoulderEntityLeft(that.getShoulderEntityLeft());
+@@ -2384,6 +2397,9 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+         if (flag) {
+             this.setYHeadRot(relativeMovements.contains(Relative.Y_ROT) ? this.getYHeadRot() + yaw : yaw);
+             this.connection.resetFlyingTicks();
++            // Leaf start - Underground Room Culling
++            this.leaf$roomVisibility.reset();
++            // Leaf end - Underground Room Culling
+         }
+ 
+         return flag;
+diff --git a/net/minecraft/server/level/TicketType.java b/net/minecraft/server/level/TicketType.java
+index 6d5bfc6e26932ba1d22b339b4bcadd2cce00c989..50b3203d254d11c388e9452a1216090d0975d572 100644
+--- a/net/minecraft/server/level/TicketType.java
++++ b/net/minecraft/server/level/TicketType.java
+@@ -68,6 +68,10 @@ public final class TicketType<T> implements ca.spottedleaf.moonrise.patches.chun
+     public static final TicketType PLUGIN_TICKET = register("plugin_ticket", NO_TIMEOUT, FLAG_LOADING | FLAG_SIMULATION); static { ((TicketType<org.bukkit.plugin.Plugin>)PLUGIN_TICKET).moonrise$setIdentifierComparator((org.bukkit.plugin.Plugin p1, org.bukkit.plugin.Plugin p2) -> p1.getName().compareTo(p2.getName())); } // Paper // Paper - rewrite chunk system
+     public static final TicketType FUTURE_AWAIT = register("future_await", NO_TIMEOUT, FLAG_LOADING | FLAG_SIMULATION); // Paper
+     public static final TicketType CHUNK_LOAD = register("chunk_load", NO_TIMEOUT, FLAG_LOADING); // Paper - moonrise
++    // Leaf start - Persistent spawn & login chunk warmup tickets
++    public static final TicketType LEAF_SPAWN_WARMUP = ca.spottedleaf.moonrise.patches.chunk_system.ticket.ChunkSystemTicketType.create("leaf:spawn_warmup", null, 3600L, FLAG_LOADING);
++    public static final TicketType LEAF_PLAYER_WARMUP = ca.spottedleaf.moonrise.patches.chunk_system.ticket.ChunkSystemTicketType.create("leaf:player_warmup", null, 600L, FLAG_LOADING);
++    // Leaf end - Persistent spawn & login chunk warmup tickets
+ 
+     private static TicketType register(String name, long timeout, @TicketType.Flags int flags) {
+         return Registry.register(BuiltInRegistries.TICKET_TYPE, name, new TicketType(timeout, flags));
+diff --git a/net/minecraft/server/network/PlayerChunkSender.java b/net/minecraft/server/network/PlayerChunkSender.java
+index 342e7f6fbb53966c879b369ffde5fee5fc2f01ef..29aec04c0d97198a33e29c097afe52687a8552ba 100644
+--- a/net/minecraft/server/network/PlayerChunkSender.java
++++ b/net/minecraft/server/network/PlayerChunkSender.java
+@@ -44,6 +44,10 @@ public class PlayerChunkSender {
+     public void dropChunk(ServerPlayer player, ChunkPos chunkPos) {
+         if (!this.pendingChunks.remove(chunkPos.toLong()) && player.isAlive()) {
+             player.connection.send(new ClientboundForgetLevelChunkPacket(chunkPos));
++            // Leaf start - Underground Room Culling
++            ServerLevel level = player.level();
++            player.leaf$roomVisibility.forgetChunk(chunkPos.x, chunkPos.z, level.getMinSectionY(), level.getMaxSectionY());
++            // Leaf end - Underground Room Culling
+             // Paper start - PlayerChunkUnloadEvent
+             if (io.papermc.paper.event.packet.PlayerChunkUnloadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+                 new io.papermc.paper.event.packet.PlayerChunkUnloadEvent(player.getBukkitEntity().getWorld().getChunkAt(chunkPos.longKey), player.getBukkitEntity()).callEvent();
+@@ -81,7 +85,7 @@ public class PlayerChunkSender {
+     public static void sendChunk(ServerGamePacketListenerImpl packetListener, ServerLevel level, LevelChunk chunk) { // Paper - rewrite chunk system - public
+         // Paper start - Anti-Xray
+         final boolean shouldModify = level.chunkPacketBlockController.shouldModify(packetListener.player, chunk);
+-        packetListener.send(new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify));
++        packetListener.send(new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify, packetListener.player));
+         // Paper end - Anti-Xray
+         // Paper start - PlayerChunkLoadEvent
+         if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+@@ -99,6 +103,7 @@ public class PlayerChunkSender {
+     // Leaf start - async chunk sender
+     public static void sendChunk(ServerGamePacketListenerImpl packetListener, ServerLevel level, LevelChunk chunk, org.dreeam.leaf.async.chunk.AsyncChunkSender chunkSender) {
+         final boolean shouldModify = level.chunkPacketBlockController.shouldModify(packetListener.player, chunk);
++        ServerPlayer player = packetListener.player;
+         net.minecraft.world.level.block.entity.BlockEntity[] blockEntities = chunk.blockEntities.values().toArray(new net.minecraft.world.level.block.entity.BlockEntity[0]);
+         java.util.Map<net.minecraft.world.level.levelgen.Heightmap.Types, long[]> heightmaps = new java.util.EnumMap<>(net.minecraft.world.level.levelgen.Heightmap.Types.class);
+         for (java.util.Map.Entry<net.minecraft.world.level.levelgen.Heightmap.Types, net.minecraft.world.level.levelgen.Heightmap> entry1 : chunk.getHeightmaps()) {
+@@ -107,7 +112,7 @@ public class PlayerChunkSender {
+             }
+         }
+         chunkSender.submit(
+-            () -> new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify, blockEntities, heightmaps)
++            () -> new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, shouldModify, blockEntities, heightmaps, player)
+         );
+     }
+     // Leaf end - async chunk sender
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index df16a023b8ece6738387fddbd90f72e90661bf53..f522a709c72d35200d0d7200b00bf528f582363d 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -1166,6 +1166,11 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+             }
+             // Imanity end - AntiXraySDK integration
+             this.chunkPacketBlockController.onBlockChange(this, pos, state, blockState, flags, recursionLeft); // Paper - Anti-Xray
++            // Leaf start - Underground Room Culling
++            if (blockState != null) {
++                org.dreeam.leaf.anticheat.roomculling.RoomCullingService.onBlockChanged(this, pos.getX(), pos.getY(), pos.getZ(), blockState, state);
++            }
++            // Leaf end - Underground Room Culling
+             // CraftBukkit end
+             if (blockState == null) {
+                 // CraftBukkit start - remove blockstate if failed (or the same)
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 99463f24f62ae866f21d79ac5df89c4ec76169f0..3ad71fa49edcc80d567e40cad253966ac9ab5962 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -267,6 +267,13 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+     }
+     // Paper end
+ 
++    // Leaf start - Do not mark clean chunks unsaved from inhabitedTime updates
++    @Override
++    public void incrementInhabitedTime(long amount) {
++        super.incrementInhabitedTime(amount);
++    }
++    // Leaf end - Do not mark clean chunks unsaved from inhabitedTime updates
++
+     @Override
+     public void markUnsaved() {
+         boolean isUnsaved = this.isUnsaved();
+diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
+index f97d6d70fcc301921adcec28d41f32a6c28deea4..331bf804ed2377893e0362d6215898fcc772c52e 100644
+--- a/net/minecraft/world/level/chunk/LevelChunkSection.java
++++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
+@@ -34,6 +34,54 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+     private short specialCollidingBlocks;
+     private final ca.spottedleaf.moonrise.common.list.ShortList tickingBlocks = new ca.spottedleaf.moonrise.common.list.ShortList();
+ 
++    // Leaf start - Underground Room Culling: 64-long occlusion bitmask
++    public static final long[] LEAF_ALL_SOLID_MASK = new long[64];
++    static {
++        java.util.Arrays.fill(LEAF_ALL_SOLID_MASK, -1L);
++    }
++
++    private volatile long @org.jspecify.annotations.Nullable [] leaf$occlusionMask;
++    private volatile int leaf$maskRevision = 0;
++
++    public long[] leaf$getOcclusionMask() {
++        long[] existing = this.leaf$occlusionMask;
++        if (existing != null) {
++            return existing;
++        }
++        if (this.hasOnlyAir()) {
++            return null;
++        }
++        if (!this.states.maybeHas(s -> !org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isPermeable(s))) {
++            return null;
++        }
++        if (!this.states.maybeHas(org.dreeam.leaf.anticheat.roomculling.RoomCullingService::isPermeable)) {
++            this.leaf$occlusionMask = LEAF_ALL_SOLID_MASK;
++            return LEAF_ALL_SOLID_MASK;
++        }
++        int rev = this.leaf$maskRevision;
++        long[] mask = new long[64];
++        boolean allSolid = true;
++        for (int ly = 0; ly < 16; ly++) {
++            for (int lz = 0; lz < 16; lz++) {
++                for (int lx = 0; lx < 16; lx++) {
++                    BlockState state = this.getBlockState(lx, ly, lz);
++                    if (!org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isPermeable(state)) {
++                        int bitIndex = (ly << 8) | (lz << 4) | lx;
++                        mask[bitIndex >>> 6] |= (1L << bitIndex);
++                    } else {
++                        allSolid = false;
++                    }
++                }
++            }
++        }
++        long[] result = allSolid ? LEAF_ALL_SOLID_MASK : mask;
++        if (this.leaf$maskRevision == rev) {
++            this.leaf$occlusionMask = result;
++        }
++        return result;
++    }
++    // Leaf end - Underground Room Culling
++
+     @Override
+     public final boolean moonrise$hasSpecialCollidingBlocks() {
+         return this.specialCollidingBlocks != 0;
+@@ -172,6 +220,10 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+             this.tickingFluidCount++;
+         }
+ 
++        if (org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isPermeable(blockState) != org.dreeam.leaf.anticheat.roomculling.RoomCullingService.isPermeable(state)) {
++            this.leaf$maskRevision++;
++            this.leaf$occlusionMask = null; // Leaf - Underground Room Culling
++        }
+         this.updateBlockCallback(x, y, z, state, blockState); // Paper - block counting
+ 
+         return blockState;
+diff --git a/net/minecraft/world/level/chunk/storage/SerializableChunkData.java b/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
+index e27b54f9dd30b08342d7ae2779d10cfdc643ed16..d10fac428aa01e0f05d903c5ee7496b1557572a5 100644
+--- a/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
++++ b/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
+@@ -446,7 +446,13 @@ public record SerializableChunkData(
+         // Paper PR end - throttle failed spawn attempts
+ 
+         if (chunkType == ChunkType.LEVELCHUNK) {
+-            return this.loadStarlightLightData(level, new ImposterProtoChunk((LevelChunk)chunkAccess, false)); // Paper - starlight
++            final ProtoChunk loaded = this.loadStarlightLightData(level, new ImposterProtoChunk((LevelChunk)chunkAccess, false)); // Paper - starlight
++            // Leaf start - Clear spurious unsaved state from initial NBT deserialization on clean chunks
++            if (set.isEmpty() && this.lightCorrect && chunkAccess.isLightCorrect()) {
++                chunkAccess.tryMarkSaved();
++            }
++            // Leaf end
++            return loaded;
+         } else {
+             ProtoChunk protoChunk1 = (ProtoChunk)chunkAccess;
+ 
+diff --git a/net/minecraft/world/level/storage/PlayerDataStorage.java b/net/minecraft/world/level/storage/PlayerDataStorage.java
+index 6ca8db9be571df9a64a7ec94cdccd883535db81f..c748fe02ebdfb3d14669e82378952ccdeaeaa539 100644
+--- a/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -198,11 +198,22 @@ public class PlayerDataStorage {
+         future.whenComplete((res, ex) -> PRELOAD_FUTURES.remove(uuid, future));
+     }
+ 
+-    private static void scheduleSpawnChunkWarmup(
+-        final net.minecraft.server.MinecraftServer server,
+-        final java.util.UUID uuid,
+-        final Optional<CompoundTag> loaded
+-    ) {
++    private record WarmupTarget(
++        Long worldUuidMost,
++        Long worldUuidLeast,
++        String worldName,
++        String dimensionStr,
++        Integer chunkX,
++        Integer chunkZ
++    ) {}
++
++    private record WarmupAreaKey(
++        net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimension,
++        int chunkX,
++        int chunkZ
++    ) {}
++
++    private static WarmupTarget extractWarmupTarget(final Optional<CompoundTag> loaded) {
+         Long worldUuidMost = null;
+         Long worldUuidLeast = null;
+         String worldName = null;
+@@ -240,73 +251,187 @@ public class PlayerDataStorage {
+             }
+         }
+ 
+-        final Long finalWorldUuidMost = worldUuidMost;
+-        final Long finalWorldUuidLeast = worldUuidLeast;
+-        final String finalWorldName = worldName;
+-        final String finalDimensionStr = dimensionStr;
+-        final Integer finalPosChunkX = posChunkX;
+-        final Integer finalPosChunkZ = posChunkZ;
++        return new WarmupTarget(worldUuidMost, worldUuidLeast, worldName, dimensionStr, posChunkX, posChunkZ);
++    }
++
++    private static net.minecraft.server.level.ServerLevel resolveWarmupLevel(
++        final net.minecraft.server.MinecraftServer server,
++        final WarmupTarget target
++    ) {
++        net.minecraft.server.level.ServerLevel targetLevel = null;
++        if (target.worldUuidMost() != null && target.worldUuidLeast() != null) {
++            final org.bukkit.World bWorld = org.bukkit.Bukkit.getServer().getWorld(new java.util.UUID(target.worldUuidMost(), target.worldUuidLeast()));
++            if (bWorld instanceof org.bukkit.craftbukkit.CraftWorld craftWorld) {
++                targetLevel = craftWorld.getHandle();
++            }
++        } else if (target.worldName() != null) {
++            final org.bukkit.World bWorld = org.bukkit.Bukkit.getServer().getWorld(target.worldName());
++            if (bWorld instanceof org.bukkit.craftbukkit.CraftWorld craftWorld) {
++                targetLevel = craftWorld.getHandle();
++            }
++        } else if (target.dimensionStr() != null) {
++            final net.minecraft.resources.Identifier dimId = net.minecraft.resources.Identifier.tryParse(target.dimensionStr());
++            if (dimId != null) {
++                final net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimKey =
++                    net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION, dimId);
++                targetLevel = server.getLevel(dimKey);
++            }
++        }
++
++        if (targetLevel == null) {
++            final LevelData.RespawnData respawnData = server.getWorldData().overworldData().getRespawnData();
++            targetLevel = server.getLevel(respawnData.dimension());
++            if (targetLevel == null) {
++                targetLevel = server.overworld();
++            }
++        }
++        return targetLevel;
++    }
++
++    private static void warmupChunkArea(
++        final net.minecraft.server.MinecraftServer server,
++        final net.minecraft.server.level.ServerLevel warmupLevel,
++        final int centerChunkX,
++        final int centerChunkZ,
++        final net.minecraft.server.level.TicketType ticketType,
++        final int radius,
++        final java.util.UUID skipIfOnlineUuid
++    ) {
++        if (warmupLevel == null || server.hasStopped()) {
++            return;
++        }
++        warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
++            if (server.hasStopped() || (skipIfOnlineUuid != null && server.getPlayerList().getPlayer(skipIfOnlineUuid) != null)) {
++                return;
++            }
++            ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel) warmupLevel).moonrise$loadChunksAsync(
++                centerChunkX - radius, centerChunkX + radius,
++                centerChunkZ - radius, centerChunkZ + radius,
++                net.minecraft.world.level.chunk.status.ChunkStatus.FULL,
++                ca.spottedleaf.concurrentutil.util.Priority.HIGH,
++                chunks -> warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
++                    if (!server.hasStopped()) {
++                        warmupLevel.getChunkSource().addTicketWithRadius(
++                            ticketType,
++                            new net.minecraft.world.level.ChunkPos(centerChunkX, centerChunkZ),
++                            radius
++                        );
++                    }
++                })
++            );
++        });
++    }
+ 
++    private static void scheduleSpawnChunkWarmup(
++        final net.minecraft.server.MinecraftServer server,
++        final java.util.UUID uuid,
++        final Optional<CompoundTag> loaded
++    ) {
++        final WarmupTarget target = extractWarmupTarget(loaded);
+         server.execute(() -> {
+             if (server.hasStopped() || server.getPlayerList().getPlayer(uuid) != null) {
+                 return;
+             }
++            final net.minecraft.server.level.ServerLevel targetLevel = resolveWarmupLevel(server, target);
++            if (targetLevel == null) {
++                return;
++            }
++            final net.minecraft.core.BlockPos worldSpawn = targetLevel.getLevelData().getRespawnData().pos();
++            final int warmupChunkX = target.chunkX() != null ? target.chunkX() : net.minecraft.core.SectionPos.blockToSectionCoord(worldSpawn.getX());
++            final int warmupChunkZ = target.chunkZ() != null ? target.chunkZ() : net.minecraft.core.SectionPos.blockToSectionCoord(worldSpawn.getZ());
++            warmupChunkArea(server, targetLevel, warmupChunkX, warmupChunkZ, net.minecraft.server.level.TicketType.LEAF_PLAYER_WARMUP, 2, uuid);
++        });
++    }
+ 
+-            net.minecraft.server.level.ServerLevel targetLevel = null;
+-            if (finalWorldUuidMost != null && finalWorldUuidLeast != null) {
+-                final org.bukkit.World bWorld = org.bukkit.Bukkit.getServer().getWorld(new java.util.UUID(finalWorldUuidMost, finalWorldUuidLeast));
+-                if (bWorld instanceof org.bukkit.craftbukkit.CraftWorld craftWorld) {
+-                    targetLevel = craftWorld.getHandle();
+-                }
+-            } else if (finalWorldName != null) {
+-                final org.bukkit.World bWorld = org.bukkit.Bukkit.getServer().getWorld(finalWorldName);
+-                if (bWorld instanceof org.bukkit.craftbukkit.CraftWorld craftWorld) {
+-                    targetLevel = craftWorld.getHandle();
+-                }
+-            } else if (finalDimensionStr != null) {
+-                final net.minecraft.resources.Identifier dimId = net.minecraft.resources.Identifier.tryParse(finalDimensionStr);
+-                if (dimId != null) {
+-                    final net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimKey =
+-                        net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION, dimId);
+-                    targetLevel = server.getLevel(dimKey);
+-                }
++    public static void warmupSpawnAndRecentPlayers(final net.minecraft.server.MinecraftServer server) {
++        if (server == null || server.hasStopped()) {
++            return;
++        }
++        final java.util.Set<WarmupAreaKey> warmed = new java.util.HashSet<>();
++
++        final net.minecraft.server.level.ServerLevel overworld = server.overworld();
++        if (overworld != null) {
++            final net.minecraft.core.BlockPos pos = overworld.getLevelData().getRespawnData().pos();
++            final int cx = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getX());
++            final int cz = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getZ());
++            if (warmed.add(new WarmupAreaKey(overworld.dimension(), cx, cz))) {
++                warmupChunkArea(server, overworld, cx, cz, net.minecraft.server.level.TicketType.LEAF_SPAWN_WARMUP, 2, null);
+             }
++        }
+ 
+-            final LevelData.RespawnData respawnData = server.getWorldData().overworldData().getRespawnData();
+-            if (targetLevel == null) {
+-                targetLevel = server.getLevel(respawnData.dimension());
+-                if (targetLevel == null) {
+-                    targetLevel = server.overworld();
++        net.minecraft.server.level.ServerLevel spawnLevel = null;
++        final org.bukkit.World bukkitSpawn = org.bukkit.Bukkit.getServer().getWorld("spawn");
++        if (bukkitSpawn instanceof org.bukkit.craftbukkit.CraftWorld craftSpawn) {
++            spawnLevel = craftSpawn.getHandle();
++        } else {
++            for (final net.minecraft.server.level.ServerLevel level : server.getAllLevels()) {
++                if ("spawn".equalsIgnoreCase(level.dimension().identifier().getPath())) {
++                    spawnLevel = level;
++                    break;
+                 }
+             }
+-            if (targetLevel == null) {
+-                return;
++        }
++        if (spawnLevel != null) {
++            final net.minecraft.core.BlockPos pos = spawnLevel.getLevelData().getRespawnData().pos();
++            final int cx = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getX());
++            final int cz = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getZ());
++            if (warmed.add(new WarmupAreaKey(spawnLevel.dimension(), cx, cz))) {
++                warmupChunkArea(server, spawnLevel, cx, cz, net.minecraft.server.level.TicketType.LEAF_SPAWN_WARMUP, 2, null);
+             }
++        }
+ 
+-            final net.minecraft.core.BlockPos respawnPos = respawnData.pos();
+-            final int warmupChunkX = finalPosChunkX != null ? finalPosChunkX : net.minecraft.core.SectionPos.blockToSectionCoord(respawnPos.getX());
+-            final int warmupChunkZ = finalPosChunkZ != null ? finalPosChunkZ : net.minecraft.core.SectionPos.blockToSectionCoord(respawnPos.getZ());
++        final File playerDir = server.playerDataStorage != null ? server.playerDataStorage.getPlayerDir() : null;
++        if (playerDir == null || !playerDir.isDirectory()) {
++            return;
++        }
+ 
+-            final net.minecraft.server.level.ServerLevel warmupLevel = targetLevel;
+-            warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
+-                if (server.hasStopped() || server.getPlayerList().getPlayer(uuid) != null) {
++        final java.util.concurrent.Executor executor = org.dreeam.leaf.async.AsyncPlayerDataSaving.IO_POOL != null
++            && !org.dreeam.leaf.async.AsyncPlayerDataSaving.IO_POOL.isShutdown()
++            ? org.dreeam.leaf.async.AsyncPlayerDataSaving.IO_POOL
++            : java.util.concurrent.ForkJoinPool.commonPool();
++
++        java.util.concurrent.CompletableFuture.supplyAsync(() -> {
++            final File[] files = playerDir.listFiles((dir, name) -> name.endsWith(".dat") && !name.endsWith(".dat_old"));
++            if (files == null || files.length == 0) {
++                return java.util.Collections.<WarmupTarget>emptyList();
++            }
++            java.util.Arrays.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
++            final int limit = Math.min(5, files.length);
++            final java.util.List<WarmupTarget> targets = new java.util.ArrayList<>(limit);
++            for (int i = 0; i < limit; i++) {
++                final File file = files[i];
++                if (!file.isFile() || file.length() == 0L) {
++                    continue;
++                }
++                try {
++                    CompoundTag tag = NbtIo.readCompressed(file.toPath(), NbtAccounter.unlimitedHeap());
++                    final int dataVersion = NbtUtils.getDataVersion(tag);
++                    tag = ca.spottedleaf.dataconverter.minecraft.MCDataConverter.convertTag(
++                        ca.spottedleaf.dataconverter.minecraft.datatypes.MCTypeRegistry.PLAYER,
++                        tag, dataVersion, ca.spottedleaf.dataconverter.minecraft.util.Version.getCurrentVersion()
++                    );
++                    targets.add(extractWarmupTarget(Optional.of(tag)));
++                } catch (Exception ignored) {
++                }
++            }
++            return targets;
++        }, executor).thenAccept(targets -> {
++            if (targets.isEmpty() || server.hasStopped()) {
++                return;
++            }
++            server.execute(() -> {
++                if (server.hasStopped()) {
+                     return;
+                 }
+-                ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel) warmupLevel).moonrise$loadChunksAsync(
+-                    warmupChunkX - 1, warmupChunkX + 1,
+-                    warmupChunkZ - 1, warmupChunkZ + 1,
+-                    net.minecraft.world.level.chunk.status.ChunkStatus.FULL,
+-                    ca.spottedleaf.concurrentutil.util.Priority.HIGHER,
+-                    chunks -> warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
+-                        if (!server.hasStopped()) {
+-                            warmupLevel.getChunkSource().addTicketWithRadius(
+-                                net.minecraft.server.level.TicketType.PLAYER_SPAWN,
+-                                new net.minecraft.world.level.ChunkPos(warmupChunkX, warmupChunkZ),
+-                                1
+-                            );
+-                        }
+-                    })
+-                );
++                for (final WarmupTarget target : targets) {
++                    final net.minecraft.server.level.ServerLevel targetLevel = resolveWarmupLevel(server, target);
++                    if (targetLevel == null || target.chunkX() == null || target.chunkZ() == null) {
++                        continue;
++                    }
++                    if (warmed.add(new WarmupAreaKey(targetLevel.dimension(), target.chunkX(), target.chunkZ()))) {
++                        warmupChunkArea(server, targetLevel, target.chunkX(), target.chunkZ(), net.minecraft.server.level.TicketType.LEAF_SPAWN_WARMUP, 2, null);
++                    }
++                }
+             });
+         });
+     }
