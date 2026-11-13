@@ -10,6 +10,7 @@ import java.util.concurrent.TimeUnit;
 public final class AsyncChunkSend {
 
     public static final int THREADS = Math.clamp(Runtime.getRuntime().availableProcessors() / 3, 1, 4);
+    private static final int OVERLOAD_QUEUE_THRESHOLD = Math.max(64, THREADS * 32);
 
     public static final ExecutorService POOL = new ThreadPoolExecutor(
         THREADS, THREADS, 0L, TimeUnit.MILLISECONDS,
@@ -23,6 +24,10 @@ public final class AsyncChunkSend {
     );
 
     private AsyncChunkSend() {
+    }
+
+    public static boolean isOverloaded() {
+        return POOL instanceof ThreadPoolExecutor executor && executor.getQueue().size() >= OVERLOAD_QUEUE_THRESHOLD;
     }
 
     public static void shutdownNow() {

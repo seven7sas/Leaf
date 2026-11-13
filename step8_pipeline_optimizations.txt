@@ -1,0 +1,56 @@
+Leaf 1.21.11 - Step 8: Block/Tick & Entity Physics Pipeline Optimizations
+===========================================================================
+
+Part 1: Block & World Tick Pipeline
+-----------------------------------
+1. O(1) Navigation & POI Early-Return (`ServerLevel.java`):
+   - `ServerLevel.sendBlockUpdated(BlockPos, BlockState oldState, BlockState newState, int flags)`:
+     Retains `this.getChunkSource().blockChanged(pos)` for client synchronization, then immediately returns if `oldState.pathType == newState.pathType && oldState.getCollisionShape(this, pos) == newState.getCollisionShape(this, pos)` before `pathTypesByPosCache.invalidate(pos)` and `navigatingMobs` iteration.
+   - `ServerLevel.updatePOIOnBlockStateChange(BlockPos, BlockState oldState, BlockState newState)`:
+     Replaces `PoiTypes.forState(...)` lookups with `if (oldState.leaf$poiType == newState.leaf$poiType) return;` and reuses `oldState.leaf$poiTypeOptional` / `newState.leaf$poiTypeOptional`.
+
+2. Alternate Current Object Pooling & Empty `BlockRedstoneEvent` Skip:
+   - Created `leaf-server/src/main/java/org/dreeam/leaf/util/RedstoneEventHelper.java`:
+     Provides `hasListeners()`, `callRedstoneChange(...)`, and `callBinaryRedstoneChange(...)` checking `BlockRedstoneEvent.getHandlerList().getRegisteredListeners().length != 0`.
+   - Updated `alternate/current/wire/LevelHelper.java`, `io/papermc/paper/redstone/RedstoneWireTurbo.java`, and vanilla redstone blocks (`RedStoneWireBlock`, `RedstoneTorchBlock`, `BasePressurePlateBlock`, `ButtonBlock`, `CommandBlock`, `DaylightDetectorBlock`, `DetectorRailBlock`, `DiodeBlock`, `ComparatorBlock`, `DoorBlock`, `FenceGateBlock`, `LecternBlock`, `LeverBlock`, `LightningRodBlock`, `ObserverBlock`, `PoweredRailBlock`, `RedstoneLampBlock`, `SculkSensorBlock`, `ShelfBlock`, `TrapDoorBlock`, `TripWireHookBlock`) to skip `CraftBlock` / `BlockRedstoneEvent` allocation when no listeners are registered.
+   - Pooled `WireNode` and `WireConnection` instances per `WireHandler`:
+     - `WireConnection.java`: made `wire`, `iDir`, `offer`, `accept` non-final and added `set(...)`.
+     - `WireConnectionManager.java`: obtains/recycles connections via `WireHandler` in `add(...)` and `clear()`.
+     - `WireNode.java`: added `setWire(...)` and `clearForPool()`.
+     - `WireHandler.java`: added `wireNodeCache` / `wireNodeCount` and intrusive `freeConnectionHead` pool (capped at `MAX_POOLED_CONNECTIONS = 4096`), clearing node references safely in `tryUpdate()` `finally` when `!updating`.
+
+3. Per-Chunk Scheduled Tick Fairness (`LevelTicks.java` & `ScheduledTicksConfig.java`):
+   - Created `leaf-server/src/main/java/org/dreeam/leaf/config/modules/opt/ScheduledTicksConfig.java`:
+     Registers `performance.max-scheduled-ticks-per-chunk-per-tick` (default `256`, `<= 0` disables cap).
+   - Updated `net.minecraft.world.ticks.LevelTicks`:
+     Tracks per-chunk drained tick count in `drainedPerChunk` (`Long2IntOpenHashMap`) across `drainContainers` and `drainFromCurrentContainer`. When a chunk reaches `maxScheduledTicksPerChunkPerTick`, leftover ticks stay in `LevelChunkTicks` and are rescheduled via `updateContainerScheduling(scheduledTick1)` for subsequent game ticks without data loss.
+
+Part 2: Entity Physics & Movement Pipeline
+------------------------------------------
+1. Section-Level Fluid Early-Skip (`LevelChunkSection.java` & `Entity.java`):
+   - Added `public boolean hasFluids() { return this.fluidCount > 0; }` in `LevelChunkSection.java`.
+   - Updated `Entity.updateFluidHeightAndDoFluidPushing`:
+     Avoids `LevelChunkSection[][]` allocation on single-chunk checks, scans intersecting sections for `hasFluids()` before allocating `MutableBlockPos`, sets `this.fluidHeight.put(fluid, 0.0)` and returns `false` early when no intersecting section has fluids, and skips empty Y sections during column iteration.
+
+2. Inside-Block Effect Cache & Fast Path (`BlockBehaviour.java` & `Entity.java`):
+   - Added `public boolean leaf$hasInsideBlockEffect` on `BlockBehaviour.BlockStateBase`, initialized in `initCache()` as `!this.fluidState.isEmpty() || ENTITY_INSIDE_OVERRIDE_CACHE.get(this.owner.getClass())` (via `ClassValue<Boolean>` inspecting subclasses up to `BlockBehaviour.class` for declared `entityInside`).
+   - Updated `Entity.checkInsideBlocks`:
+     Clears `visitedBlocks` only when `!set.isEmpty()`, and routes short non-player/server-controlled movements (`!flag1 && !(this instanceof Player) && !this.isClientAuthoritative() && from.distanceToSqr(to) < 0.0625D`) through `leaf$checkInsideBlocksFast` scanning loaded chunk sections directly, skipping `hasOnlyAir()` sections and `!blockState.leaf$hasInsideBlockEffect` blocks cleanly.
+
+3. Collision Lookup Skip & FallingBlockEntity Stacking / Cobweb Fast Path:
+   - `ChunkEntitySlices.java`: added `hasHardCollidingEntities()` (`hardCollidingEntities.count != 0`) and zero-allocation `exceedsSameCellEntityLimit(...)`.
+   - `EntityLookup.java` & `Level.java`: tracks `hardCollidingEntityCount` on entity add/remove; `Level.moonrise$getHardCollidingEntities` returns `Collections.emptyList()` without `ArrayList` allocation when count is zero, and `EntityLookup.getHardCollidingEntities` skips chunks where `!chunk.hasHardCollidingEntities()`.
+   - `FallingBlockEntity.java`:
+     - Cobweb micro-movement fast path in `tick()` when `!noPhysics && stuckSpeedMultiplier.lengthSqr() > 1.0E-7D`, moving inside empty-collision `(cellX, cellY, cellZ)` bounds (`newMinY > cellY + 0.01D`, no hard-colliding entities) without full `Entity.move` collision sweep.
+     - Drops item (`dropItem && ENTITY_DROPS`) and calls `discard(EntityRemoveEvent.Cause.DROP)` when `!onGround()` and `deltaMovement.lengthSqr() < 0.0001D` with >= 8 other slow `FallingBlockEntity` instances in the same `(blockPos.getX(), blockPos.getY(), blockPos.getZ())` cell.
+
+4. LaggingEntityGuard v2 Confirmation:
+   - Verified `LaggingEntityGuard.java` (`suspect-strikes = 2`, `min-entities-in-chunk = 25`, `max-entity-tick-nanos = 4_000_000L`, `required-strikes = 8`, `max-chunk-entity-tick-nanos = 10_000_000L`) and `ServerLevel.java` (`THREAD_MX.getCurrentThreadCpuTime()`, `leaf$totalGcCollections()` GC guard, strike reset on fast tick).
+
+Verification
+------------
+- `.\gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:createMojmapBundlerJar`: BUILD SUCCESSFUL (exit code 0).
+- Deployed `leaf-server\build\libs\leaf-bundler-1.21.11-R0.1-SNAPSHOT-mojmap.jar` to `D:\Works\server_test\IceWorld\server.jar`.
+- `java -jar "D:\Works\server_test\IceWorld\server.jar" --version`: exited 0 (`Starting org.bukkit.craftbukkit.Main`, `1.21.11-DEV-20e885f`).
+- `./gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:test --tests "org.dreeam.leaf.*"`: BUILD SUCCESSFUL (exit code 0; ran existing `org.dreeam.leaf.*` test filter; compiled test classes ran `:leaf-server:test`).
+- Note on git tracking: `leaf-server/src/minecraft` is ignored by `.gitignore:28:leaf-server/src/minecraft`; paperweight uses `./gradlew rebuildMinecraftPatches` to export `leaf-server/src/minecraft` edits into `leaf-server/minecraft-patches/`.

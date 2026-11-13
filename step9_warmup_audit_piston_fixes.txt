@@ -1,0 +1,77 @@
+Leaf & IceWorld Plugins - Step 9: Warmup Registry, Plugin Audit & Piston/Waypoint/LevelData Fixes
+====================================================================================================
+
+Part 1: CoreLib Warmup Single-Listener Static Registry
+------------------------------------------------------
+- File: `D:\iceworld\IceWorld\CoreLib\src\main\java\dev\sevensas\corelib\warmup\Warmup.java`
+- Preserved public API signatures:
+  `Warmup(Plugin, BiConsumer<Long, Player>)`, `teleport(Plugin)`, both `start(...)` overloads, `cancel(Player, boolean)`, `isActive(Player)`.
+- Replaced per-instance `Bukkit.getPluginManager().registerEvents(this, plugin)` and `implements Listener` on `Warmup` with a single static `WarmupListener` registered once via `AtomicBoolean LISTENER_REGISTERED`.
+- Added shared static `ACTIVE` (`ConcurrentHashMap<UUID, Entry>`) holding `record Entry(Warmup owner, BukkitTask task, Consumer<Player> onCancel)`.
+- Added `ACTIVE.isEmpty()` and `ACTIVE.containsKey(uuid)` fast-paths in `WarmupListener.onMove(PlayerMoveEvent)` (after block-coordinate check) and `WarmupListener.onDamage(EntityDamageEvent)`, plus `@EventHandler public void onQuit(PlayerQuitEvent)` cleanup.
+- Updated completion cleanup to `ACTIVE.remove(uuid, currentEntry)` and player lookups to `OnlineTracker.getPlayer(uuid)`; `isActive(Player)` checks `e != null && e.owner() == this`.
+
+Part 2: IceWorld Plugin Audit & Hot-Event Fast-Paths (22 Modified Files, 10 Deployed JARs)
+------------------------------------------------------------------------------------------
+1. `IceItems`:
+   - `IceItems/src/main/java/dev/sevensas/iceitems/item/ItemUtil.java`: removed unused `implements Listener` (had no `@EventHandler` methods).
+2. `IceCases`:
+   - `IceCases/src/main/java/dev/sevensas/icecases/animation/Animation.java`: updated `forceStop()` to always invoke `HandlerList.unregisterAll(this)` and `cancelTasks()` even when `!running`.
+3. `IceCheck`:
+   - `IceCheck/src/main/java/dev/murk/icecheck/manager/CheckManager.java`: added `hasActiveTargets()` and `hasAnyChecks()`.
+   - `IceCheck/src/main/java/dev/murk/icecheck/listeners/CancelListener.java`: added `!manager.hasActiveTargets()` early-returns across frozen-target event handlers and `!manager.hasAnyChecks()` + allocation-free command parsing in `PlayerCommandPreprocessEvent`.
+   - `IceCheck/src/main/java/dev/murk/icecheck/manager/AFKManager.java`: switched `lastLocations`, `sameLocationCount`, and `afkStatus` to `ConcurrentHashMap` for async/main thread safety, and avoided `player.getLocation().clone()` in `resetAFK` when the player remains in the same block.
+4. `IcePrivates`:
+   - `IcePrivates/src/main/java/dev/sevensas/iceprivates/privates/PrivateStorage.java`: added `isEmpty()`, `hasWorldPrivates(UUID)`, and `worlds.isEmpty()` fast-path in `onChunkUnload(ChunkUnloadEvent)`.
+   - `IcePrivates/src/main/java/dev/sevensas/iceprivates/privates/decay/PrivateDecayManager.java`: added `isIdle()` (`activeBreakAnimations.isEmpty()`).
+   - `IcePrivates/src/main/java/dev/sevensas/iceprivates/privates/listener/PrivateEntryListener.java`: added `storage.isEmpty() && insidePrivate.isEmpty()` early-returns in `onMove`/`onTeleport`, `storage.isEmpty()` in `onJoin`, and `insidePrivate.isEmpty()` in `onQuit`.
+   - `IcePrivates/src/main/java/dev/sevensas/iceprivates/privates/listener/PrivateProtectionListener.java`: added `storage.isEmpty() && decayManager.isIdle()` fast-paths in `onBreak`, `onExplode` (block & entity), `onInteract`, and `storage.isEmpty()` in `handleBucket`, `onArmorStandManipulate`, `onHangingBreak`, `onInteractEntity`, `onEntityDamage` (kept `onPlace` active).
+5. `IceStaff`:
+   - `IceStaff/src/main/java/dev/murk/icestaff/data/StaffDatabase.java`: added `isEmpty()` (`staffByUuid.isEmpty()`).
+   - `IceStaff/src/main/java/dev/murk/icestaff/tracker/StaffTracker.java`: added `isEmpty()` fast-paths in `onMove`, `onInteract`, `onChat`, `onCommand`.
+6. `IcePvP`:
+   - `IcePvP/src/main/java/dev/murk/icepvp/impl/PvPManager.java`: added `isEmpty()` (`pvpPlayers.isEmpty()`) and `if (allowedTeleports.isEmpty()) return;` in the 1-tick scheduler task.
+   - `IcePvP/src/main/java/dev/murk/icepvp/listener/PvPListener.java`: added early-returns on `PlayerCommandPreprocessEvent`, `ProjectileLaunchEvent`, `PlayerTeleportEvent`, `PlayerDeathEvent`, `PlayerQuitEvent`, `PlayerKickEvent` and guarded `allowedTeleports.remove(...)` with `!allowedTeleports.isEmpty()`.
+7. `IceTroll`:
+   - `IceTroll/src/main/java/dev/murk/icetroll/services/DamageTickService.java` & `DamageService.java`: added `isEmpty()`.
+   - `IceTroll/src/main/java/dev/murk/icetroll/listeners/bukkit/DamageTickTrollListener.java` & `DamageTrollListener.java`: added `isEmpty()` checks before `instanceof Player` casts.
+8. `IceEnchants`:
+   - `IceEnchants/src/main/java/dev/sevensas/iceenchants/enchant/impl/armor/CrystallizationEnchantment.java`, `WindbreakerEnchantment.java`, and `tool/FrostBarrierEnchantment.java`: added `isEmpty()` / damage-cause early exits on `onDamage`, `onBlockBreak`, `onQuit`, `onDeath`.
+9. `IceQuests`:
+   - `IceQuests/src/main/java/dev/sevensas/icequests/quest/QuestManager.java`: added `if (event.getAction() != org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK) return;` before `getClickedBlock()` and replaced `.name().endsWith("_CANDLE_CAKE")` allocation with `org.bukkit.Tag.CANDLE_CAKES.isTagged(type)` in `onInteractCake`.
+10. Other audited listeners (no changes needed):
+   - `IceEvents` (`Event.stop()` unregisters via `HandlerList.unregisterAll(this)`), `IceStructures` (`TrialTraderManager.isTrader` checks `EntityType` before PDC), `IceClubs` (`PvPListener` / `StorageListener` fast-paths present), `IceSeller` (`AutoSell` / `AutoSellStorage` singletons unregister in `close()`), `CoreLib` (`MenuListener`, `DamageIndicator` already checks `OnlineTracker.isEmpty()`).
+
+Part 3: Leaf Core Optimizations (6 Modified Files)
+---------------------------------------------------
+1. Piston Entity Lookup & Empty Event Skip:
+   - `d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\level\entity\ChunkEntitySlices.java`:
+     Added `hasEntitiesInSection(int sectionY)` checking `allEntities.count == 0` and `entitiesBySection[sectionIndex] != null`.
+   - `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\block\piston\PistonMovingBlockEntity.java`:
+     Added `hasPotentialPistonEntities(...)` checking `[px - 3 .. px + 4]` X/Z and `[py - 3 .. py + (sticky ? 5 : 4)]` Y sections (`ChunkEntitySlices.isEmpty()` / `hasEntitiesInSection(...)`) at start of `moveCollidedEntities` and `moveStuckEntities` before `getCollisionShape` / `AABB` / `level.getEntities`.
+   - `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\block\piston\PistonBaseBlock.java`:
+     Guarded `BlockPistonExtendEvent` / `BlockPistonRetractEvent` and `CraftBlock` / `AbstractList<Block>` wrapper creation behind `getHandlerList().getRegisteredListeners().length != 0`, preserving full Bukkit/WorldGuard behavior when listeners are registered.
+
+2. Waypoint Manager Overhead Elimination:
+   - `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\server\waypoints\ServerWaypointManager.java`:
+     Added immediate return on `players.isEmpty() || (waypoints.size() <= 1 && connections.isEmpty())`. Replaced Guava `Tables.transpose`, `Sets.difference`, `ImmutableSet.copyOf`, and `HashBasedTable.row` in `updateWaypoint`, `updatePlayer`, and `untrackWaypoint` with direct iteration over `this.players` / `this.waypoints` and `this.connections`. Cached integer block coordinates per `ServerPlayer` and `WaypointTransmitter` via `Reference2LongOpenHashMap` (`lastPlayerBlockPos`, `lastWaypointBlockPos`), cleared/invalidated on `trackWaypoint`, `untrackWaypoint`, `addPlayer`, `removePlayer`, `breakAllConnections`, `remakeConnections`.
+
+3. LevelData Async Compression & WorldGenSettings Tag Cache:
+   - `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\storage\PrimaryLevelData.java`:
+     Cached serialized `WorldGenSettings` NBT tag (`cachedWorldGenSettingsTag`, `cachedWorldGenSource`) in `setTagData(...)`, storing `.copy()` into `tag`, and changed `customBossEvents` put to `.copy()` for thread safety.
+   - `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\storage\LevelStorageSource.java`:
+     Moved `FastByteArrayOutputStream` and `NbtIo.writeCompressed(tag, nbtBytes)` inside `AsyncPlayerDataSaving.submitLevelSave(() -> ...)` in `saveLevelData(CompoundTag)`.
+
+Verification & Deployment
+-------------------------
+- IceWorld plugin build (`D:\iceworld\IceWorld\gradlew.bat -p "D:\iceworld\IceWorld" :CoreLib:assemble :IceCases:assemble :IceCheck:assemble :IceEnchants:assemble :IceItems:assemble :IcePrivates:assemble :IcePvP:assemble :IceQuests:assemble :IceStaff:assemble :IceTroll:assemble`):
+  `BUILD SUCCESSFUL in 1m 56s` (exit code 0, 53 actionable tasks executed).
+- Deployed 10 updated JARs from `D:\iceworld\IceWorld\target\` to `D:\Works\server_test\IceWorld\plugins\`:
+  `CoreLib-1.0.jar`, `IceCases-1.0.jar`, `IceCheck-1.0.jar`, `IceEnchants-1.0.jar`, `IceItems-1.0.jar`, `IcePrivates-1.0.jar`, `IcePvP-1.0.jar`, `IceQuests-1.0.jar`, `IceStaff-1.0.jar`, `IceTroll-1.0.jar`.
+- Leaf build (`.\gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:createMojmapBundlerJar`):
+  `BUILD SUCCESSFUL in 6m 13s` (exit code 0).
+- Deployed `d:\iceworld\Leaf\leaf-server\build\libs\leaf-bundler-1.21.11-R0.1-SNAPSHOT-mojmap.jar` to `D:\Works\server_test\IceWorld\server.jar` (123874986 bytes).
+- `java -jar "D:\Works\server_test\IceWorld\server.jar" --version`:
+  Exited 0 (`Starting org.bukkit.craftbukkit.Main`, `1.21.11-DEV-20e885f`).
+- `.\gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:test --tests "org.dreeam.leaf.*"`:
+  `BUILD SUCCESSFUL in 40s` (exit code 0; `org.dreeam.leaf.world.region.linear.LinearV3TestSuite`: `tests="5" skipped="0" failures="0" errors="0"`).

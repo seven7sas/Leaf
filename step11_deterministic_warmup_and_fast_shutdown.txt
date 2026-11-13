@@ -1,0 +1,48 @@
+Leaf 1.21.11 - Step 11: Deterministic Spawn/Join Warmup & Clean-Chunk Fast Shutdown
+====================================================================================
+
+1. Startup & Login Chunk Warmup (TicketType.java, PlayerDataStorage.java, DedicatedServer.java)
+-----------------------------------------------------------------------------------------------
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\server\level\TicketType.java` (L71-74):
+  - Added `LEAF_SPAWN_WARMUP = ChunkSystemTicketType.create("leaf:spawn_warmup", null, 3600L, FLAG_LOADING);` (L72, 3 min / 3600 ticks).
+  - Added `LEAF_PLAYER_WARMUP = ChunkSystemTicketType.create("leaf:player_warmup", null, 600L, FLAG_LOADING);` (L73, 30 sec / 600 ticks).
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\storage\PlayerDataStorage.java` (L201-437):
+  - Extracted shared warmup helpers `WarmupTarget` (L201), `WarmupAreaKey` (L210), `extractWarmupTarget` (L216), `resolveWarmupLevel` (L257), and `warmupChunkArea` (L291).
+  - Updated `scheduleSpawnChunkWarmup` (L325) to warm a 5x5 radius (`radius = 2`) with `TicketType.LEAF_PLAYER_WARMUP` (`600L` ticks) and `Priority.HIGH`.
+  - Added `warmupSpawnAndRecentPlayers(MinecraftServer server)` (L346-437) to warm 5x5 areas around the `overworld` respawn point, the `spawn` world respawn point, and up to 5 most recently modified `playerdata/*.dat` coordinates (scanned asynchronously, scheduled onto server thread, deduplicated via `WarmupAreaKey`) using `TicketType.LEAF_SPAWN_WARMUP` (`3600L` ticks) and `Priority.HIGH`.
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\server\dedicated\DedicatedServer.java` (L458):
+  - Calls `PlayerDataStorage.warmupSpawnAndRecentPlayers(this);` inside `initServer()` after `this.initPostWorld()` (L426) and before `this.notificationManager().serverStarted();` (L459), ensuring plugin-loaded worlds such as `spawn` are already registered.
+
+2. Deterministic 7x7 Multi-Pass Ramp & Single-Tick Spike Immunity (RegionizedPlayerChunkLoader.java)
+-----------------------------------------------------------------------------------------------------
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\player\RegionizedPlayerChunkLoader.java`:
+  - `tick()` (L318-325): Executes `loader.updateQueues(currTime, true)` followed by up to 2 additional `loader.updateQueues(currTime, false)` passes while `!loader.removed && loader.sentChunks.size() < 49 && loader.hasReadyFullChunkPending()`.
+  - `isBoostUnderLoad()` (L417-436): While `this.sentChunks.size() < 49`, ignores single-tick `MinecraftServer.lastTickProperTime` / `server.lagging` spikes and returns `true` only if `server == null`, `AsyncChunkSend.isOverloaded()`, or `server.getAverageTickTimeNanos() > 45_000_000L`. Once `sentChunks.size() >= 49`, preserves `server.lagging`, 80% MSPT budget, and `lastTickProperTime` checks.
+  - `hasReadyFullChunkPending()` (L438-464): Checks whether `loadingQueue` has ready chunks, `genQueue` has live `ChunkStatus.FULL` chunks, `generatingQueue` has ready full chunks, or `sendQueue` is non-empty so extra `tick()` passes are skipped when cold chunks are still waiting on disk I/O.
+  - `updateQueues()` (L773-830): Raises hot RAM `ChunkStatus.FULL` promotion limit and async send target to `49` (7x7) when `this.sentChunks.size() < 49 && !isBoostUnderLoad()`, while keeping cold disk promotions capped at `12L + (long)this.rampTickCount * 6L` and keeping synchronous sends strictly `< 9` within Chebyshev radius `<= 1`.
+
+3. Eliminate Spurious Unsaved Chunk Marks on Clean Worlds (LevelChunk.java, SerializableChunkData.java, ChunkLoadTask.java)
+--------------------------------------------------------------------------------------------------------------------------
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\chunk\LevelChunk.java` (L270-275):
+  - Overrode `incrementInhabitedTime(long amount)` to call `super.incrementInhabitedTime(amount);` without `markUnsaved()`.
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\chunk\storage\SerializableChunkData.java` (L448-456):
+  - In `read()`, calls `chunkAccess.tryMarkSaved()` when `chunkType == ChunkType.LEVELCHUNK && set.isEmpty() && this.lightCorrect && chunkAccess.isLightCorrect()`, clearing spurious initial `unsaved` / `pdc.dirty` flags triggered during chunk deserialization.
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\scheduling\task\ChunkLoadTask.java` (L341-365):
+  - Captures `rawDataVersion` before `upgradeChunkTag` and explicitly calls `chunk.markUnsaved()` when `rawDataVersion != SharedConstants.getCurrentVersion().dataVersion().version()` so DataFixer-upgraded chunks are still saved.
+
+4. High-Priority Parallel Shutdown Serialization & Worker Config (NewChunkHolder.java, ChunkHolderManager.java, paper-global.yml)
+----------------------------------------------------------------------------------------------------------------------------------
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\scheduling\NewChunkHolder.java` (L1687, L1706-1756):
+  - Added `Priority` overload to `saveChunk(...)`; `save(boolean shutdown)` passes `shutdown ? Priority.HIGH : Priority.NORMAL` into `scheduler.saveExecutor` (`MoonriseCommon.WORKER_POOL`) and `MoonriseRegionFileIO.scheduleSave(..., priority)`.
+- `d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\scheduling\ChunkHolderManager.java` (L290, L328-331):
+  - Raised `flushThreshold` in `saveAllChunks(...)` to `512` when `shutdown && !emergency` (keeping `100` otherwise) so `MoonriseRegionFileIO.partialFlush` triggers every 512 chunks during clean shutdown.
+- `D:\Works\server_test\IceWorld\config\paper-global.yml` (L45-47):
+  - Configured `chunk-system.io-threads: 2` and `chunk-system.worker-threads: 4`.
+
+5. Build, Deployment & Verification
+-----------------------------------
+- `.\gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:createMojmapBundlerJar`: `BUILD SUCCESSFUL in 5m 29s` (exit code 0).
+- Deployed bundler JAR to `D:\Works\server_test\IceWorld\server.jar` (123,882,477 bytes).
+- `java -jar "D:\Works\server_test\IceWorld\server.jar" --version`: exited 0 (`Starting org.bukkit.craftbukkit.Main`, `1.21.11-DEV-6c5c8e5`).
+- `.\gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:test --tests "org.dreeam.leaf.*"`: `BUILD SUCCESSFUL in 39s` (exit code 0; `org.dreeam.leaf.world.region.linear.LinearV3TestSuite`: `tests="5" skipped="0" failures="0" errors="0"`).
+- Note: Changes in `d:\iceworld\Leaf` remain uncommitted in the working tree (as requested previously until in-game verification; not committed/pushed to Paperweight patches).

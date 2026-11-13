@@ -1,0 +1,41 @@
+Leaf 1.21.11 - Step 10: Cross-World Teleport Fix & Hot/Cold Chunk Ramp-Up Split
+================================================================================
+
+1. Teleport Ticket-Lock Fix & Multi-Pass Tick (RegionizedPlayerChunkLoader.java)
+---------------------------------------------------------------------------------
+- File: `d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\player\RegionizedPlayerChunkLoader.java`
+- `PlayerChunkLoaderData.add()` (L1062-1112):
+  Removed `updateQueues(...)` calls inside `add()`, leaving only `this.update()` so cross-world teleports inside `ServerLevel.addDuringTeleport` -> `EntityLookup.entityStatusChange` never invoke `ChunkHolderManager.processTicketUpdates()` while `BLOCK_TICKET_UPDATES` is set (`IllegalStateException: Cannot update ticket level while unloading chunks or updating entity manager`).
+- `RegionizedPlayerChunkLoader.tick()` (L307-328):
+  Calls `loader.updateQueues(currTime, true);` after `loader.update();`, then executes up to 2 additional `loader.updateQueues(currTime, false);` passes while `!loader.removed && loader.sentChunks.size() < 9 && (!loader.loadingQueue.isEmpty() || !loader.genQueue.isEmpty() || !loader.generatingQueue.isEmpty())` before `loader.advanceSpawnRamp()`.
+
+2. Hot RAM vs Cold Disk Chunk Separation & MSPT Protection
+------------------------------------------------------------
+- `PlayerDataStorage.scheduleSpawnChunkWarmup` (`d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\storage\PlayerDataStorage.java`, L295-311):
+  Remains strictly 3x3 (`warmupChunkX - 1 .. warmupChunkX + 1`, `warmupChunkZ - 1 .. warmupChunkZ + 1`, `addTicketWithRadius(..., 1)`).
+- `AsyncChunkSend.isOverloaded()` (`d:\iceworld\Leaf\leaf-server\src\main\java\org\dreeam\leaf\async\chunk\AsyncChunkSend.java`, L13, L29-31):
+  Checks `POOL instanceof ThreadPoolExecutor executor && executor.getQueue().size() >= OVERLOAD_QUEUE_THRESHOLD` (`Math.max(64, THREADS * 32)`).
+- `PlayerChunkLoaderData.isBoostUnderLoad()` (`RegionizedPlayerChunkLoader.java`, L418-433):
+  Returns `true` if `AsyncChunkSend.isOverloaded()`, `server == null`, `server.lagging`, `server.getAverageTickTimeNanos() > (budgetNanos * 4L) / 5L` (>40 ms at 20 TPS), or `MinecraftServer.lastTickProperTime > loadThresholdMillis`. Disables all hot/send boosts for the current tick when triggered.
+- `loadQueue` (`RegionizedPlayerChunkLoader.java`, L786-854):
+  - Cold disk cap during `rampingUp`: `12L + (long)this.rampTickCount * 6L` (`maxColdLoads` respects `getMaxChunkLoads()` and `chunkLoadTicketLimiter`; initial 3x3 start burst capped at `Math.min(9L, maxColdLoads)` only on primary pass when `boostAllowed`).
+  - Hot RAM boost: when `allowInitialLoadBurst && boostAllowed`, allows promoting up to `32` chunks per tick where `holderManager.getChunkHolder(nextChunk)` exists and `holder.getCurrentGenStatus() == ChunkStatus.FULL` above the cold limit.
+- `genQueue` (`RegionizedPlayerChunkLoader.java`, L890-937):
+  - Limits cold promotions (`ChunkFullTask` / `ChunkLoadEvent`) to `12 + this.rampTickCount * 6` during `rampingUp` (`tickColdGensRemaining`), while allowing up to `32` live `ChunkStatus.FULL` holders (`tickHotGensRemaining`) when not under load.
+- `sendQueue` (`RegionizedPlayerChunkLoader.java`, L976-1047):
+  - During `rampingUp` when `boostAllowed && this.asyncSender != null`, allows up to `Math.min(16 + this.rampTickCount * 12, this.sendQueue.size())` sends per tick bounded across passes (`tickRampedSendsRemaining`), keeping `< 9` chunks within Chebyshev radius `<= 1` synchronous via `sendChunk(...)` and routing remaining chunks strictly through asynchronous `this.leaf$sendChunk(...)`.
+  - When under load (`!boostAllowed`) or `asyncSender == null`, skips boost and caps at `9 + this.rampTickCount * 8` (keeping `9 - this.sentChunks.size()` minimum floor while `this.sentChunks.size() < 9`).
+
+3. Paper Global Chunk Rate Config
+---------------------------------
+- File: `D:\Works\server_test\IceWorld\config\paper-global.yml` (L41-44):
+  - `chunk-loading-basic.player-max-chunk-load-rate: 150.0`
+  - `chunk-loading-basic.player-max-chunk-send-rate: 150.0`
+
+4. Build, Deployment & Verification
+-----------------------------------
+- `.\gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:createMojmapBundlerJar`: `BUILD SUCCESSFUL in 5m 46s` (exit code 0).
+- Deployed `d:\iceworld\Leaf\leaf-server\build\libs\leaf-bundler-1.21.11-R0.1-SNAPSHOT-mojmap.jar` to `D:\Works\server_test\IceWorld\server.jar` (123,876,595 bytes).
+- `java -jar "D:\Works\server_test\IceWorld\server.jar" --version`: exited 0 (`Starting org.bukkit.craftbukkit.Main`, `1.21.11-DEV-6c5c8e5`).
+- `.\gradlew.bat -p "d:\iceworld\Leaf" :leaf-server:test --tests "org.dreeam.leaf.*"`: `BUILD SUCCESSFUL in 45s` (exit code 0; `org.dreeam.leaf.world.region.linear.LinearV3TestSuite`: `tests="5" skipped="0" failures="0" errors="0"`).
+- Note: Changes in `Leaf` (`AsyncChunkSend.java`, `RegionizedPlayerChunkLoader.java`) were rebuilt/deployed to `D:\Works\server_test\IceWorld\server.jar` and not yet committed/rebuilt into Paperweight feature patches (kept uncommitted until tested).

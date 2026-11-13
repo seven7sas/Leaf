@@ -1,0 +1,237 @@
+================================================================================
+LEAF SERVER - SPAWN CHUNK WARMUP, INSTANT 3x3 CHUNK SEND & SHUTDOWN FIXES
+Total Modified Files: 6
+  1) Async 3x3 spawn chunk warmup after player.dat preload (File #1)
+  2) Instant spawn chunk load/send burst in add() & sync 3x3 chunk sending (File #2)
+  3) Early AsyncChunkSend cancellation before world saving on server stop (Files #3-#5)
+  4) Parallel RegionFileStorage flush/close across Util.ioPool() (File #6)
+================================================================================
+
+MODIFIED FILES LIST:
+  #1: d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\storage\PlayerDataStorage.java
+  #2: d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\player\RegionizedPlayerChunkLoader.java
+  #3: d:\iceworld\Leaf\leaf-server\src\main\java\org\dreeam\leaf\async\chunk\AsyncChunkSend.java
+  #4: d:\iceworld\Leaf\leaf-server\src\main\java\org\dreeam\leaf\async\ShutdownExecutors.java
+  #5: d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\server\MinecraftServer.java
+  #6: d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\level\chunk\storage\RegionFileStorage.java
+
+BUILD & DEPLOYMENT VERIFICATION:
+  Gradle task :leaf-server:createMojmapBundlerJar -> BUILD SUCCESSFUL (exit code 0)
+  Output JAR  : d:\iceworld\Leaf\leaf-server\build\libs\leaf-bundler-1.21.11-R0.1-SNAPSHOT-mojmap.jar (123,856,390 bytes)
+  Deployed to : D:\Works\server_test\IceWorld\server.jar
+  Version chk : java -jar D:\Works\server_test\IceWorld\server.jar --version -> 1.21.11-DEV-1845a9e (exit code 0)
+
+################################################################################
+FILE #1: leaf-server/src/minecraft/java/net/minecraft/world/level/storage/PlayerDataStorage.java
+################################################################################
+Changed Lines: 180-312 (of 357)
+Summary:
+  - In preloadAsync(NameAndId), once loadFromDisk finishes and preloaded cache
+    entries are stored, calls scheduleSpawnChunkWarmup(server, uuid, loaded).
+  - scheduleSpawnChunkWarmup extracts WorldUUIDMost/WorldUUIDLeast, legacy
+    "world", "Dimension", and "Pos" coordinates on the async I/O thread, then
+    schedules main-thread execution via server.execute(...).
+  - Resolves target ServerLevel (falling back to overworld respawn dimension)
+    and chunk coordinates (falling back to overworld respawn block pos), then
+    dispatches via warmupLevel.getChunkSource().mainThreadProcessor.execute(...)
+    (for full parallel-world-ticking thread safety) to trigger
+    moonrise$loadChunksAsync(cx - 1, cx + 1, cz - 1, cz + 1, ChunkStatus.FULL,
+    Priority.HIGHER, ...) and add TicketType.PLAYER_SPAWN (radius 1, 20-tick
+    expiry) back on warmupLevel.getChunkSource().mainThreadProcessor.
+
+  180:         java.util.concurrent.CompletableFuture<Optional<CompoundTag>> future = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+  181:             Optional<CompoundTag> loaded = this.loadFromDisk(nameAndId);
+  182:             java.util.concurrent.atomic.AtomicLong gen = SAVE_GENERATIONS.get(uuid);
+  183:             if ((gen == null || gen.get() == genAtStart)
+  184:                 && (server == null || server.getPlayerList().getPlayer(uuid) == null)) {
+  185:                 PRELOADED_TIMESTAMPS.put(uuid, System.currentTimeMillis());
+  186:                 PRELOADED_PLAYER_DATA.put(uuid, loaded);
+  187:                 if (server != null && !server.hasStopped()) {
+  188:                     scheduleSpawnChunkWarmup(server, uuid, loaded);
+  189:                 }
+  190:             }
+  191:             return loaded;
+  192:         }, executor);
+  ...
+  201:     private static void scheduleSpawnChunkWarmup(
+  202:         final net.minecraft.server.MinecraftServer server,
+  203:         final java.util.UUID uuid,
+  204:         final Optional<CompoundTag> loaded
+  205:     ) {
+  ...
+  290:             final net.minecraft.server.level.ServerLevel warmupLevel = targetLevel;
+  291:             warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
+  292:                 if (server.hasStopped() || server.getPlayerList().getPlayer(uuid) != null) {
+  293:                     return;
+  294:                 }
+  295:                 ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel) warmupLevel).moonrise$loadChunksAsync(
+  296:                     warmupChunkX - 1, warmupChunkX + 1,
+  297:                     warmupChunkZ - 1, warmupChunkZ + 1,
+  298:                     net.minecraft.world.level.chunk.status.ChunkStatus.FULL,
+  299:                     ca.spottedleaf.concurrentutil.util.Priority.HIGHER,
+  300:                     chunks -> warmupLevel.getChunkSource().mainThreadProcessor.execute(() -> {
+  301:                         if (!server.hasStopped()) {
+  302:                             warmupLevel.getChunkSource().addTicketWithRadius(
+  303:                                 net.minecraft.server.level.TicketType.PLAYER_SPAWN,
+  304:                                 new net.minecraft.world.level.ChunkPos(warmupChunkX, warmupChunkZ),
+  305:                                 1
+  306:                             );
+  307:                         }
+  308:                     })
+  309:                 );
+  310:             });
+
+################################################################################
+FILE #2: leaf-server/src/minecraft/java/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+################################################################################
+Changed Lines: 705-755, 909-958, 1028-1039 (of 1262)
+Summary:
+  - Added updateQueues(long time, boolean allowInitialLoadBurst) overload so
+    initial join/teleport burst promotes up to 25 chunks from loadQueue
+    (lines 752-755) and sends up to 9 chunks from sendQueue on tick 0 /
+    rampingUp == true & rampTickCount == 0 (or sentChunks < 9 when ramp-up is
+    disabled, lines 909-922) even immediately after limiter.reset(time).
+  - For the initial 3x3 chunks around spawn (sentChunks.size() < 9 &&
+    Chebyshev distance <= 1 from (lastChunkX, lastChunkZ)), bypasses the
+    background AsyncChunkSend.POOL queue and sends chunks synchronously via
+    this.sendChunk(pendingSendX, pendingSendZ) (lines 945-958).
+  - In add() right after this.update(), immediately runs updateQueues(...) and
+    advances already-loaded FULL chunks through loading -> generating ->
+    sendQueue so the initial 3x3 chunks are queued in the login packet flush
+    before ServerGamePacketListenerImpl.resumeFlushing() runs (lines 1029-1038).
+
+  705:         void updateQueues(final long time) {
+  706:             this.updateQueues(time, true);
+  707:         }
+  708:
+  709:         private void updateQueues(final long time, final boolean allowInitialLoadBurst) {
+  ...
+  752:             int maxLoadsThisTick = (int)this.chunkLoadTicketLimiter.takeAllocation(time, loadRate, maxLoads);
+  753:             if (allowInitialLoadBurst && ((this.rampingUp && this.rampTickCount == 0) || (!this.rampingUp && this.sentChunks.isEmpty()))) {
+  754:                 maxLoadsThisTick = Math.max(maxLoadsThisTick, Math.min(25, this.loadQueue.size()));
+  755:             }
+  ...
+  909:             int maxSendsThisTick = Math.min((int)this.chunkSendLimiter.takeAllocation(time, sendRate, maxSends), this.sendQueue.size());
+  910:             // Leaf start - Smooth chunk send ramp-up: start with 9 priority chunks on spawn tick and expand smoothly
+  911:             if (this.rampingUp) {
+  912:                 final int rampSendCap = 9 + this.rampTickCount * 8;
+  913:                 if (maxSendsThisTick > rampSendCap) {
+  914:                     maxSendsThisTick = rampSendCap;
+  915:                 }
+  916:                 if (this.rampTickCount == 0) {
+  917:                     maxSendsThisTick = Math.max(maxSendsThisTick, Math.min(9, this.sendQueue.size()));
+  918:                 }
+  919:             } else if (this.sentChunks.size() < 9) {
+  920:                 maxSendsThisTick = Math.max(maxSendsThisTick, Math.min(9 - this.sentChunks.size(), this.sendQueue.size()));
+  921:             }
+  922:             // Leaf end
+  ...
+  945:                 if (this.asyncSender != null) {
+  946:                     if (this.sentChunks.size() < 9 && Math.max(Math.abs(pendingSendX - this.lastChunkX), Math.abs(pendingSendZ - this.lastChunkZ)) <= 1) {
+  947:                         this.sendQueue.dequeueLong();
+  948:                         this.sendChunk(pendingSendX, pendingSendZ);
+  949:                     } else if (this.leaf$sendChunk(pendingSendX, pendingSendZ)) {
+  950:                         this.sendQueue.dequeueLong();
+  951:                     } else {
+  952:                         break;
+  953:                     }
+  954:                 } else {
+  955:                     this.sendQueue.dequeueLong();
+  956:                     this.sendChunk(pendingSendX, pendingSendZ);
+  957:                 }
+  ...
+ 1028:             this.update();
+ 1029:             if (!this.removed) {
+ 1030:                 final long queueTime = System.nanoTime();
+ 1031:                 this.updateQueues(queueTime, true);
+ 1032:                 if (!this.removed && this.sentChunks.size() < 9 && (!this.loadingQueue.isEmpty() || !this.genQueue.isEmpty() || !this.generatingQueue.isEmpty())) {
+ 1033:                     this.updateQueues(queueTime, false);
+ 1034:                     if (!this.removed && this.sentChunks.size() < 9 && (!this.generatingQueue.isEmpty() || !this.sendQueue.isEmpty())) {
+ 1035:                         this.updateQueues(queueTime, false);
+ 1036:                     }
+ 1037:                 }
+ 1038:             }
+
+################################################################################
+FILE #3: leaf-server/src/main/java/org/dreeam/leaf/async/chunk/AsyncChunkSend.java
+################################################################################
+Changed Lines: 28-32 (of 33)
+Summary:
+  - Added AsyncChunkSend.shutdownNow() to drop queued chunk-packet tasks once
+    players have been disconnected during server shutdown.
+
+   28:     public static void shutdownNow() {
+   29:         if (!POOL.isShutdown()) {
+   30:             POOL.shutdownNow();
+   31:         }
+   32:     }
+
+################################################################################
+FILE #4: leaf-server/src/main/java/org/dreeam/leaf/async/ShutdownExecutors.java
+################################################################################
+Changed Lines: 53-62 (of 72)
+Summary:
+  - Guarded AsyncChunkSend.POOL shutdown check with !POOL.isTerminated() and
+    !POOL.isShutdown() since stopServer() now cancels pending tasks earlier.
+
+   53:         if (org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL != null && !org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.isTerminated()) {
+   54:             if (!org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.isShutdown()) {
+   55:                 LOGGER.info("Waiting for async chunk sender pool to shutdown...");
+   56:                 org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.shutdown();
+   57:             }
+   58:             try {
+   59:                 org.dreeam.leaf.async.chunk.AsyncChunkSend.POOL.awaitTermination(10L, TimeUnit.SECONDS);
+   60:             } catch (InterruptedException ignored) {
+   61:             }
+   62:         }
+
+################################################################################
+FILE #5: leaf-server/src/minecraft/java/net/minecraft/server/MinecraftServer.java
+################################################################################
+Changed Lines: 1115-1117 (of 3283)
+Summary:
+  - Invokes AsyncChunkSend.shutdownNow() right after playerList.removeAll(...)
+    and before saveAllChunks(...) so packet encoding threads stop competing
+    for CPU and memory while worlds save and close.
+
+ 1115:         // Leaf start - Cancel pending async chunk packet encoding once all players disconnected before world saving
+ 1116:         org.dreeam.leaf.async.chunk.AsyncChunkSend.shutdownNow();
+ 1117:         // Leaf end
+
+################################################################################
+FILE #6: leaf-server/src/minecraft/java/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
+################################################################################
+Changed Lines: 447-513 (of 527)
+Summary:
+  - Extracted synchronized helper runOnRegionFiles(RegionFileAction) used by
+    both close() and flush().
+  - When multiple open IRegionFile instances exist in regionCache, drains
+    files across a bounded pool of Math.min(files.length, Math.clamp(CPUs / 2,
+    2, 4)) workers on Util.ioPool() via an AtomicInteger index (avoiding
+    unbounded native ZstdCompressCtx allocations in FastThreadLocal), collecting
+    any IOExceptions into ExceptionCollector.
+
+  447:     @FunctionalInterface
+  448:     private interface RegionFileAction {
+  449:         void run(abomination.IRegionFile regionFile) throws IOException;
+  450:     }
+  451:
+  452:     private void runOnRegionFiles(final RegionFileAction action) throws IOException {
+  ...
+  498:     @Override
+  499:     public void close() throws IOException {
+  500:         // Paper start - rewrite chunk system
+  501:         synchronized (this) {
+  502:             this.runOnRegionFiles(abomination.IRegionFile::close);
+  503:         }
+  504:         // Paper end - rewrite chunk system
+  505:     }
+  506:
+  507:     public void flush() throws IOException {
+  508:         // Paper start - rewrite chunk system
+  509:         synchronized (this) {
+  510:             this.runOnRegionFiles(abomination.IRegionFile::flush);
+  511:         }
+  512:         // Paper end - rewrite chunk system
+  513:     }
+================================================================================

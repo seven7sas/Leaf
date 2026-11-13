@@ -1,0 +1,75 @@
+================================================================================
+LEAF SERVER - LAGGING ENTITY GUARD v2 (CPU/GC/DENSITY VERIFICATION)
+Modified/Created Files: 4
+  1) Configuration module org.dreeam.leaf.config.modules.opt.LaggingEntityGuard (File #1)
+  2) Zero-alloc ChunkEntitySlices.getEntityCount() helper (File #2)
+  3) ItemEntity/ExperienceOrb protection & Entity.leaf$isProtectedFromLagCull() (File #3)
+  4) Two-stage ThreadMXBean CPU + GC verification & chunk cull in ServerLevel.java (File #4)
+================================================================================
+
+FILES LIST:
+  #1: d:\iceworld\Leaf\leaf-server\src\main\java\org\dreeam\leaf\config\modules\opt\LaggingEntityGuard.java (66 lines)
+  #2: d:\iceworld\Leaf\leaf-server\src\minecraft\java\ca\spottedleaf\moonrise\patches\chunk_system\level\entity\ChunkEntitySlices.java (lines 220-222 of 658)
+  #3: d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\world\entity\Entity.java (lines 192-258 of 5866)
+  #4: d:\iceworld\Leaf\leaf-server\src\minecraft\java\net\minecraft\server\level\ServerLevel.java (lines 242-269, 1072-1174, 1769-1890 of 3540)
+
+BUILD & DEPLOYMENT VERIFICATION:
+  Gradle task :leaf-server:createMojmapBundlerJar -> BUILD SUCCESSFUL in 8m 17s (exit code 0)
+  Output JAR  : d:\iceworld\Leaf\leaf-server\build\libs\leaf-bundler-1.21.11-R0.1-SNAPSHOT-mojmap.jar (123,864,098 bytes)
+  Deployed to : D:\Works\server_test\IceWorld\server.jar
+  Version chk : java -jar D:\Works\server_test\IceWorld\server.jar --version -> 1.21.11-DEV-20e885f (exit code 0)
+
+################################################################################
+FILE #1: leaf-server/src/main/java/org/dreeam/leaf/config/modules/opt/LaggingEntityGuard.java
+################################################################################
+Config base path: performance.lagging-entity-guard
+  - enabled = true
+  - min-entities-in-chunk = 25
+  - max-entity-tick-nanos = 4_000_000L
+  - suspect-strikes = 2
+  - required-strikes = 8
+  - max-chunk-entity-tick-nanos = 10_000_000L
+  - required-chunk-strikes = 6
+  - max-items-in-chunk-before-cull = 150
+  - log-removals = true
+
+################################################################################
+FILE #2: leaf-server/src/minecraft/java/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices.java
+################################################################################
+Lines 220-222:
+  - Added getEntityCount() returning this.entities.size() without list allocation.
+
+################################################################################
+FILE #3: leaf-server/src/minecraft/java/net/minecraft/world/entity/Entity.java
+################################################################################
+Lines 192-258:
+  - leaf$isProtectedFromLagCull() protects ItemEntity, ExperienceOrb, and
+    delegates to leaf$isProtectedExcludingItems().
+  - leaf$isProtectedExcludingItems() protects Player, EnderDragon,
+    EnderDragonPart, WitherBoss, tamed TamableAnimal, custom-named entities,
+    invulnerable entities, vehicles with protected passengers, and entities
+    with "npc" in tags, Bukkit metadata ("NPC"/"npc"), or PDC keys.
+
+################################################################################
+FILE #4: leaf-server/src/minecraft/java/net/minecraft/server/level/ServerLevel.java
+################################################################################
+Lines 242-269, 1072-1174, 1769-1890:
+  - Static THREAD_MX (isThreadCpuTimeSupported && isThreadCpuTimeEnabled) and
+    LEAF_GC_BEANS tracking total GC collections per tick.
+  - Skips entities whose ChunkEntitySlices.getEntityCount() < minEntitiesInChunk
+    (resets leaf$lagStrikes = 0).
+  - Below suspectStrikes: fast System.nanoTime() measurement; resets strikes
+    immediately to 0 when wallElapsed < maxEntityTickNanos.
+  - At/above suspectStrikes: measures both System.nanoTime() and
+    THREAD_MX.getCurrentThreadCpuTime(); skips strike accrual on GC ticks or
+    OS context switches (cpuElapsed == 0 || cpuElapsed < maxEntityNanos / 2 ||
+    cpuElapsed < wallElapsed / 2). Discards at requiredStrikes with both
+    wall ms and cpu ms logged.
+  - Chunk watchdog requires slices.getEntityCount() >= minEntitiesInChunk and
+    requiredChunkStrikes (6) consecutive non-GC ticks >= maxChunkEntityTickNanos
+    (resets chunk strike on first normal tick). In leaf$cullLaggingChunkEntities,
+    ItemEntity is only culled if chunk ItemEntity count exceeds
+    maxItemsInChunkBeforeCull (150); other buckets run in priority order
+    (FallingBlockEntity -> Projectile -> ItemEntity -> AbstractMinecart ->
+    AbstractBoat -> excess Mob keeping up to 16).
+================================================================================

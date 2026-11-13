@@ -1,0 +1,118 @@
+IceWorld Plugins - Step 12: Events, Schematics & CoreLib Comprehensive Optimizations
+========================================================================================
+
+1. Part 1: Event Lifecycle, Thread Race Guards & Mini-Pit Fix (Event.java, Timer.java, BlastDrop.java, Smuggler.java)
+----------------------------------------------------------------------------------------------------------------------
+- Files:
+  - `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\event\Event.java`
+  - `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\timer\Timer.java`
+  - `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\event\impl\BlastDrop.java`
+  - `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\event\impl\Smuggler.java`
+- Mini-Pit (-5 Y) Preservation Without Argument Mutation:
+  - In `BlastDrop.start(Location loc)` and `Smuggler.start(Location loc)`, creates `Location pitLoc = loc.clone().subtract(0, 5, 0);` and passes `pitLoc` to `super.start(pitLoc);`.
+  - The original `loc` passed by callers is never mutated. `pitLoc` is passed into spawn chat coordinates, `pasteBuilder.at(pitLoc)`, border generation, and `centerLoc` calculation (`pitLoc.clone().add(0, 1, 0)`), preserving the designed -5 Y mini-pit depression.
+  - `Event.start(Location)` stores independent defensive clones: `this.location = location.clone(); this.center = location.clone().toCenterLocation();`.
+- Lifecycle States & Safe Cancellation:
+  - Added `Event.State` enum (`IDLE`, `STARTING`, `RUNNING`, `STOPPING`), `volatile State state = State.IDLE;`, and `volatile boolean running = false;`.
+  - Added thread-safe task registries `activeBukkitTasks` and `activeAsyncTasks` (`CopyOnWriteArrayList`), `registerTask(BukkitTask)`, `registerTask(AsyncTask)`, and `cancelAllTasks()`.
+  - In `Event.start()`, sets `state = State.STARTING` and verifies `this.state == State.STARTING` both after asynchronous `generateLocation()` completes and inside the scheduled main-thread `runTask` before calling `start(loc)`. If `stop()` was called while generating location, start is safely aborted.
+  - In `Event.stop()`, sets `state = State.STOPPING`, `running = false`, invokes `cancelAllTasks()`, cancels `locationFuture`, unregisters event listeners from `HandlerList`, removes WorldGuard region, clears location references, and transitions to `State.IDLE`.
+- Timer Fixes:
+  - In `Timer.tick()`, invokes `currentEvent.tick(tick)` only when `currentEvent != null && currentEvent.isRunning()`.
+  - `isCurrentStarted()` returns `currentEvent != null && (currentEvent.isRunning() || currentEvent.getState() == Event.State.STARTING)`.
+  - In `Timer.next()`, cleanly stops `prev.stop()`, resets `tick = 0`, starts `nextEvent.start()`, and selects a new random next event.
+
+2. Part 2: AnimationEngine Task Leak Elimination & Unified Shockwave (AnimationEngine.java)
+-------------------------------------------------------------------------------------------
+- File: `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\animation\AnimationEngine.java`
+- Event Lifecycle Binding:
+  - Added `BooleanSupplier isCancelled` parameters to `playChestDrop`, `playDistributionExplosion`, `spawnFlyingBarrel`, and `playShockwave` (alongside backward-compatible overloads).
+  - All running animations check `isCancelled.getAsBoolean()` on every tick; upon cancellation, tasks abort immediately, remove `VirtualBlockDisplay`s from `tracker`, and do NOT invoke completion callbacks (preventing barrels or chests from spawning in the world after `schematic.undo()`).
+- Unified Shockwave (Replaced 150+ Parallel Tasks):
+  - Rewrote `playShockwave` so that a single `AsyncTask` manages all expanding rings (radius 1..5) and updates transformations for all jumping blocks (`activeJumpingBlocks`) in a single loop.
+  - Eliminated `center.clone().add(x, y, z).getBlock()` allocations by querying `world.getBlockAt(cx + x, cy + y, cz + z)` directly.
+  - Replaced `Math.sqrt` with integer squared distance comparisons (`int distSq = x * x + z * z`).
+- BlockState NMS / No-Snapshot Lookups:
+  - On tick 1 of `playDistributionExplosion`, replaced `centerLoc.getBlock().getState() instanceof Lidded` with `centerLoc.getBlock().getState(false) instanceof Lidded lidded`, avoiding tile entity NBT snapshot allocations.
+- BlockData Caching:
+  - Cached `Bukkit.createBlockData(Material.TNT)` (`TNT_DATA`) and `Bukkit.createBlockData(Material.BARREL)` (`BARREL_DATA`) in `static final` constants.
+
+3. Part 3: Smuggler & BlastDrop Optimization & Death Handler (Smuggler.java, BlastDrop.java)
+--------------------------------------------------------------------------------------------
+- Files:
+  - `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\event\impl\BlastDrop.java`
+  - `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\event\impl\Smuggler.java`
+- No-Snapshot Container Fills:
+  - In `BlastDrop.supply()`: replaced `(Barrel) b.getState()` with `if (b.getState(false) instanceof Barrel barrel) { lootGenerator.fill(barrel.getInventory()); }`.
+  - In `Smuggler.newContraband()`: replaced `(Chest) block.getState()` with `if (block.getState(false) instanceof Chest chest) { lootGenerator.fill(chest.getInventory()); }`.
+- O(1) Contraband Identification & Entity Tracker:
+  - Tagged contraband item with `NamespacedKey("iceevents", "contraband")` in its `PersistentDataContainer` (`PersistentDataType.BYTE`).
+  - Rewrote `isContraband(ItemStack)` to inspect PDC in O(1), eliminating expensive `ItemStack.isSimilar` component comparisons.
+  - Added direct reference `private Item droppedContraband;` with `@EventHandler EntityPickupItemEvent` and `PlayerDropItemEvent`.
+  - Added `@EventHandler public void onDeath(PlayerDeathEvent event)`: removes contraband from `event.getDrops()`, spawns item at `player.getLocation()`, tracks it in `this.droppedContraband`, sets glowing, teleports if $> 240.25$, and resets `playerHoldingItem`.
+  - Completely eliminated the 60x60x60 cube entity search from `tick()`. Added lightweight fallback scan in `centerLoc.getNearbyEntities(20, 20, 20)` once every 10 ticks only when holder and dropped reference are missing.
+  - Replaced every-tick inventory scanning (`containsAtLeast`) with distance & inventory checks scheduled once every 10 ticks.
+  - Guarded glowing updates with `if (!droppedContraband.isGlowing()) droppedContraband.setGlowing(true);` to eliminate duplicate `SetEntityDataPacket` packets.
+- BossBar Packet Optimization:
+  - Reduced `bossBarTracker.tick()` execution to once every 10 ticks (`if (tick % 10 == 0) bossBarTracker.tick();`).
+  - In `Smuggler.tick()`, `bossBar.name(...)` is sent only when the rendered title actually changes.
+  - In `BlastDrop.tick()` and `Smuggler.tick()`, `bossBar.progress(...)` updates only when difference is >= 0.005f or once every 10 ticks.
+
+4. Part 4: GpsBar MiniMessage & Packet Load Elimination (GpsBar.java)
+--------------------------------------------------------------------
+- File: `D:\iceworld\IceWorld\IceEvents\src\main\java\dev\sevensas\iceevents\gps\bar\GpsBar.java`
+- Execution Frequency:
+  - Switched task interval from every 1 tick to every 4 ticks (`runTaskTimer(plugin, this::tick, 4, 4)`).
+- Component & Packet Throttling:
+  - Added fields to `PlayerGpsData`: `int lastDistanceInt = -1;`, `Direction lastRenderedDirection = null;`, `float lastProgress = -1f;`, and `Event lastEvent = null;`.
+  - `Messages.fComponent(titleStr)` and `data.bossBar.name(...)` are evaluated ONLY when `(int) distance`, `direction`, or `event` changes. When walking straight or standing within the same meter, 0 `MiniMessage` parsing calls and 0 packets are generated.
+  - `data.bossBar.progress(...)` updates only when difference is >= 0.01f.
+- Cache & Concurrency Fixes:
+  - Fixed `maxDistance` to invalidate and recompute whenever `event != lastTrackedEvent`.
+  - Class implements `Listener` and registers events in constructor (`Bukkit.getPluginManager().registerEvents(this, plugin);`).
+  - Backed `activeBars` with `ConcurrentHashMap` and added `@EventHandler onQuit(PlayerQuitEvent)` to clean up disconnected players immediately.
+
+5. Part 5: PasteBuilder Fast Remove, In-Memory Clipboard Cache & Multi-Source BFS Smoothing (IceSchematics & CoreLib)
+---------------------------------------------------------------------------------------------------------------------
+- Files:
+  - `D:\iceworld\IceWorld\IceSchematics\src\main\java\dev\sevensas\iceschematics\schem\SchematicManager.java`
+  - `D:\iceworld\IceWorld\IceSchematics\src\main\java\dev\sevensas\iceschematics\schem\PasteBuilder.java`
+  - `D:\iceworld\IceWorld\IceSchematics\src\main\java\dev\sevensas\iceschematics\util\Smoothing.java`
+  - `D:\iceworld\IceWorld\CoreLib\src\main\java\dev\sevensas\corelib\online\OnlineTracker.java`
+- Schematic Clipboard Cache:
+  - In `SchematicManager`, added `clipboardCache` (`Map<String, CachedClipboard>`) caching parsed WorldEdit `Clipboard` objects keyed by schematic name and file `lastModified`.
+  - Added `cloneClipboard(Clipboard)` with `copy.setOrigin(source.getOrigin())` using `BlockArrayClipboard` and `ForwardExtentCopy` to duplicate clipboards in memory without disk I/O.
+  - In `PasteBuilder.paste()`, retrieves cached clipboards via `SchematicManager.get().getClipboard(name)`.
+- PasteBuilder removeBlocks / removeLiquid Optimization:
+  - Cached `CAN_BE_WATERLOGGED` (`ConcurrentHashMap<BlockType, Boolean>`) to avoid calling `getProperty("waterlogged")` string lookups on types that cannot be waterlogged.
+  - Early-returns on air blocks (`clipState.getBlockType().getMaterial().isAir()` and `worldState.getBlockType().getMaterial().isAir()`), immediately bypassing ~180,000 empty checks.
+  - Y bounds for liquid removal span `origin.y() - removeRadius .. origin.y() + removeRadius` bounded by world min/max height, ensuring that water hovering above the -5 Y pit is cleanly removed.
+  - Replaced intermediate `BlockVector3` object allocations with integer coordinate offsets.
+- Smoothing Algorithm Optimization (Smoothing.java):
+  - Compact "Ellipse Up" Pit Architecture & Overhang Protection:
+    - Floor Alignment: `pitFloorY = baseFloorY` aligns the pit floor flush with red wool (`RED_WOOL`) and foundation blocks instead of dropping 1 block lower.
+    - Technical Block Filter: `isEmptyOrTechnical` ignores `LIGHT` and `STRUCTURE_VOID` during schematic scanning, preventing single floating dirt blocks under invisible light sources.
+    - Center & Dynamic Radii: `centerX, centerZ` computed from projected non-air schematic blocks. `pitRadius = maxBlockDist + 1.5`, `outerRadius = pitRadius + clearance` (no extra bloated margins).
+    - Strict Floor vs Overhang Separation:
+      - Only blocks at floor level `worldY <= baseFloorY + 1` are fixed to `worldY - 1` with foundation underpinning downward.
+      - Overhangs `worldY >= baseFloorY + 2` (tent roofs, scarecrow arms, arches) are NEVER fixed to `worldY - 1`; they are treated as pit floor `pitFloorY` so space between `pitFloorY + 1` and `worldY - 1` under overhangs is completely hollow air, eliminating stone and dirt pillars.
+    - "Ellipse Up" Wall Profile: Flat horizontal tangent at pit floor ($t=0$) and steep elliptical climb ($curve = 1.0 - \sqrt{1 - t^2}$) over width `clearance` up to natural terrain ($t=1$).
+    - Ping-Pong Diffusion (4 iterations): Smooths voxel stair-stepping only on transitional pit walls (`!isFixed`), preserving flat pit floor and outer terrain.
+    - Terrain Modification & Safe Clearance: Places `topState` at `targetHeight` only when not occupied by a schematic block. Clearance loop clears strictly above `baseHeight` down to `baseHeight`, never digging ground under the structure.
+  - Primitive 2D Arrays: Zero-allocation primitive grids `schematicLowestY[W][D]`, `heightMap[W][D]`, `originalHeights[W][D]`, `isFixed[W][D]`.
+  - Fast BlockType Sets & Snowy Cache: Static `NATURAL_TERRAIN_TYPES`, `FOLIAGE_CACHE`, and `SNOWY_PROPERTY`.
+  - Powder Snow & Gravel Fix: Replaced `topState` of `POWDER_SNOW` with `SNOW_BLOCK` and mapped `GRAVEL -> STONE` in `FILLER_MAP`.
+  - Logging: Added SLF4J logger `Schematics#Smoothing`.
+- OnlineTracker Player Iteration:
+  - Rewrote `OnlineTracker.getNearbyPlayers(Location, double)` and `forEachNearby` to iterate `world.getPlayers()` instead of global proxy `SNAPSHOT` or `World.getNearbyEntities`.
+  - Computes `dx * dx + dy * dy + dz * dz <= radiusSq` without allocating `Location` objects.
+
+6. Build, Deployment & Verification
+-----------------------------------
+- Gradle Build:
+  - Command: `.\gradlew.bat -p "D:\iceworld\IceWorld" :IceSchematics:assemble`
+  - Result: `BUILD SUCCESSFUL in 46s` (exit code 0; 6 tasks executed/up-to-date).
+- Deployed Plugin JARs to `D:\Works\server_test\IceWorld\plugins\`:
+  - `CoreLib-1.0.jar`: 660,567 bytes (13.11.2026 02:29:52)
+  - `IceSchematics-1.0.jar`: 22,240 bytes (13.11.2026 05:05:32)
+  - `IceEvents-1.0.jar`: 94,679 bytes (13.11.2026 02:47:44)
